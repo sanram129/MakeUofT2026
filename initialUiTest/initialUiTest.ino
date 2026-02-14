@@ -1,15 +1,18 @@
 /*
-  Pathfinder UI (Layout Option A): Big Arrow + Big Distance
+  Pathfinder UI: Smooth 0–360° Arrow + Smooth Distance (No Big White Wipe)
   Target: Arduino UNO Q + DIYables_TFT_ILI9486_Shield
 
-  Notes:
-  - This code ONLY draws the UI with sample values.
-  - Replace the sample values (gpsLock, sats, batteryV, distanceM, turnText, errDeg)
-    with your real sensor/nav values later.
+  How to use with your real nav:
+    rawErrDeg = wrap180(bearingToHomeDeg - headingDeg);   // -180..+180 (right positive)
+    rawDistM  = distanceToHomeMeters;
 */
 
 #include <DIYables_TFT_Shield.h>
 #include <Arduino_RouterBridge.h>
+
+#include <math.h>
+#include <string.h>
+#include <stdio.h>
 
 // Colors
 #define WHITE     DIYables_TFT::colorRGB(255, 255, 255)
@@ -21,231 +24,303 @@
 
 DIYables_TFT_ILI9486_Shield TFT_display;
 
-// ---------------- UI Geometry ----------------
+// UI Geometry
 static const int STATUS_H = 30;
 static const int BOTTOM_H = 50;
 static const int MARGIN   = 10;
 
-enum ArrowDir { ARROW_STRAIGHT, ARROW_LEFT, ARROW_RIGHT };
+// Layout (computed after begin)
+static int W, H;
+static int mainTop, mainBot, mainH;
+static int arrowCX, arrowCY;
+static int arrowSize;
 
-void drawArrow(int cx, int cy, int size, ArrowDir dir, uint16_t fill, uint16_t outline = 0xFFFF, bool doOutline=false) {
-  // proportions you can tweak
-  int headLen = (int)(size * 0.45);   // head length
-  int headHalfW = (int)(size * 0.28); // half head width
-  int shaftThick = (int)(size * 0.18);// shaft thickness
+// Distance “card” region (fixed box so redraw is clean)
+static int distBoxX, distBoxY, distBoxW, distBoxH;
 
-  // constrain (avoid 0)
-  if (shaftThick < 4) shaftThick = 4;
-  if (headHalfW < 6) headHalfW = 6;
+// Timing
+static const uint32_t ARROW_PERIOD_MS  = 40;   // 25 FPS arrow
+static const uint32_t DIST_PERIOD_MS   = 120;  // distance update ~8 Hz
+static const uint32_t STATUS_PERIOD_MS = 500;  // status/bottom ~2 Hz
 
-  if (dir == ARROW_LEFT) {
-    int xTip  = cx - size/2;
-    int xBase = xTip + headLen;
-    int xEnd  = cx + size/2;
+static uint32_t tArrow=0, tDist=0, tStatus=0;
 
-    // head triangle
-    TFT_display.fillTriangle(xTip, cy,
-                             xBase, cy - headHalfW,
-                             xBase, cy + headHalfW,
-                             fill);
+// Smoothed display values
+static float dispAngleDeg = 0.0f;  // 0..360 (0 = up, 90 = right, 180 = down)
+static float dispDistM    = 0.0f;
 
-    // shaft
-    TFT_display.fillRect(xBase, cy - shaftThick/2,
-                         xEnd - xBase, shaftThick,
-                         fill);
+// Last drawn values (for minimal redraw)
+static float lastDrawnAngleDeg = 9999.0f;
+static int   lastDrawnDistInt  = -9999;
 
-    if (doOutline) {
-      TFT_display.drawTriangle(xTip, cy, xBase, cy - headHalfW, xBase, cy + headHalfW, outline);
-      TFT_display.drawRect(xBase, cy - shaftThick/2, xEnd - xBase, shaftThick, outline);
-    }
-  }
-  else if (dir == ARROW_RIGHT) {
-    int xTip  = cx + size/2;
-    int xBase = xTip - headLen;
-    int xEnd  = cx - size/2;
-
-    TFT_display.fillTriangle(xTip, cy,
-                             xBase, cy - headHalfW,
-                             xBase, cy + headHalfW,
-                             fill);
-
-    TFT_display.fillRect(xEnd, cy - shaftThick/2,
-                         xBase - xEnd, shaftThick,
-                         fill);
-
-    if (doOutline) {
-      TFT_display.drawTriangle(xTip, cy, xBase, cy - headHalfW, xBase, cy + headHalfW, outline);
-      TFT_display.drawRect(xEnd, cy - shaftThick/2, xBase - xEnd, shaftThick, outline);
-    }
-  }
-  else { // ARROW_STRAIGHT (UP)
-    int yTip  = cy - size/2;
-    int yBase = yTip + headLen;
-    int yEnd  = cy + size/2;
-
-    TFT_display.fillTriangle(cx, yTip,
-                             cx - headHalfW, yBase,
-                             cx + headHalfW, yBase,
-                             fill);
-
-    TFT_display.fillRect(cx - shaftThick/2, yBase,
-                         shaftThick, yEnd - yBase,
-                         fill);
-
-    if (doOutline) {
-      TFT_display.drawTriangle(cx, yTip, cx - headHalfW, yBase, cx + headHalfW, yBase, outline);
-      TFT_display.drawRect(cx - shaftThick/2, yBase, shaftThick, yEnd - yBase, outline);
-    }
-  }
+// ---------------- Angle helpers ----------------
+static inline float wrap360(float a) {
+  while (a < 0) a += 360.0f;
+  while (a >= 360.0f) a -= 360.0f;
+  return a;
 }
 
+static inline float wrap180(float a) {
+  a = wrap360(a);
+  if (a > 180.0f) a -= 360.0f;
+  return a;
+}
 
-void drawStatusBar(int w, bool gpsLock, int sats, float batteryV) {
-  // Background
-  TFT_display.fillRect(0, 0, w, STATUS_H, GRAY);
-  TFT_display.drawLine(0, STATUS_H - 1, w, STATUS_H - 1, BLACK);
+// shortest signed difference from current -> target (degrees), in [-180, +180]
+static inline float angDiffDeg(float target, float current) {
+  return wrap180(target - current);
+}
 
-  // Left: GPS
+// exponential smoothing on angles, correctly handling wrap-around
+static float smoothAngleDeg(float current, float target, float alpha) {
+  float d = angDiffDeg(target, current);      // shortest way
+  return wrap360(current + alpha * d);
+}
+
+// ---------------- UI Draw ----------------
+void drawStatusBar(bool gpsLock, int sats, float batteryV) {
+  TFT_display.fillRect(0, 0, W, STATUS_H, GRAY);
+  TFT_display.drawLine(0, STATUS_H - 1, W, STATUS_H - 1, BLACK);
+
   TFT_display.setTextSize(2);
-  TFT_display.setCursor(MARGIN, 6);
-  if (gpsLock) {
-    TFT_display.setTextColor(GREEN);
-    TFT_display.print("GPS: LOCK");
-  } else {
-    TFT_display.setTextColor(RED);
-    TFT_display.print("GPS: --");
-  }
 
-  // Middle: SAT
+  // GPS
+  TFT_display.setCursor(MARGIN, 6);
+  if (gpsLock) { TFT_display.setTextColor(GREEN); TFT_display.print("GPS: LOCK"); }
+  else         { TFT_display.setTextColor(RED);   TFT_display.print("GPS: --");   }
+
+  // SAT
   TFT_display.setTextColor(BLACK);
-  TFT_display.setCursor(w / 2 - 55, 6);
+  TFT_display.setCursor(W/2 - 55, 6);
   TFT_display.print("SAT: ");
   TFT_display.print(sats);
 
-  // Right: BAT
-  TFT_display.setCursor(w - 150, 6);
+  // BAT
+  TFT_display.setCursor(W - 150, 6);
   TFT_display.print("BAT: ");
   TFT_display.print(batteryV, 1);
   TFT_display.print("V");
 }
 
-void drawBottomBar(int w, int h, const char* turnText, int errDeg) {
-  int y0 = h - BOTTOM_H;
-  TFT_display.fillRect(0, y0, w, BOTTOM_H, GRAY);
-  TFT_display.drawLine(0, y0, w, y0, BLACK);
+void drawBottomBar(const char* turnText, int errDegSigned) {
+  int y0 = H - BOTTOM_H;
+  TFT_display.fillRect(0, y0, W, BOTTOM_H, GRAY);
+  TFT_display.drawLine(0, y0, W, y0, BLACK);
 
-  // Left: TURN text
   TFT_display.setTextSize(3);
   TFT_display.setTextColor(MAGENTA);
   TFT_display.setCursor(MARGIN, y0 + 10);
   TFT_display.print(turnText);
 
-  // Right: error
   TFT_display.setTextSize(2);
   TFT_display.setTextColor(BLACK);
-  TFT_display.setCursor(w - 170, y0 + 18);
+  TFT_display.setCursor(W - 170, y0 + 18);
   TFT_display.print("ERR ");
-  if (errDeg >= 0) TFT_display.print("+");
-  TFT_display.print(errDeg);
-  TFT_display.print((char)247); // degree symbol (often works as 247)
+  if (errDegSigned >= 0) TFT_display.print("+");
+  TFT_display.print(errDegSigned);
+  TFT_display.print((char)247);
 }
 
-void drawMainArea(int w, int h, ArrowDir dir, int distanceM) {
-  int yTop = STATUS_H;
-  int yBot = h - BOTTOM_H;
-  int areaH = yBot - yTop;
+// Rotating arrow (0°=up, 90°=right). Drawn as triangles (fast).
+// To erase without flicker, draw the SAME arrow again using WHITE fill+WHITE outline.
+void drawArrowRot(float angleDeg, uint16_t fill, uint16_t outline) {
+  float rad = angleDeg * 3.1415926f / 180.0f;
 
-  TFT_display.fillRect(0, yTop, w, areaH, WHITE);
+  // Arrow shape in local coords (pointing up at angleDeg=0)
+  float L = arrowSize * 0.60f;   // length
+  float Wd = arrowSize * 0.42f;  // width
+  float tailW = Wd * 0.30f;
+  float tailL = L * 0.40f;
 
-  int cx = w / 2;
-  int cy = yTop + areaH / 2 - 40;
+  // Main pointer triangle: tip, left, right
+  float x0=0,      y0=-L;
+  float x1=-Wd/2,  y1= L*0.35f;
+  float x2= Wd/2,  y2= L*0.35f;
 
-  //  Use the computed direction
-  drawArrow(cx, cy, 160, dir, MAGENTA, BLACK, true);
+  // Tail triangle: makes it look like a nav arrow
+  float x3=-tailW/2, y3=L*0.35f;
+  float x4= tailW/2, y4=L*0.35f;
+  float x5= 0,       y5=L*0.35f + tailL;
+
+  auto RX = [&](float x, float y){ return x*cosf(rad) - y*sinf(rad); };
+  auto RY = [&](float x, float y){ return x*sinf(rad) + y*cosf(rad); };
+
+  int X0 = arrowCX + (int)RX(x0,y0), Y0 = arrowCY + (int)RY(x0,y0);
+  int X1 = arrowCX + (int)RX(x1,y1), Y1 = arrowCY + (int)RY(x1,y1);
+  int X2 = arrowCX + (int)RX(x2,y2), Y2 = arrowCY + (int)RY(x2,y2);
+
+  int X3 = arrowCX + (int)RX(x3,y3), Y3 = arrowCY + (int)RY(x3,y3);
+  int X4 = arrowCX + (int)RX(x4,y4), Y4 = arrowCY + (int)RY(x4,y4);
+  int X5 = arrowCX + (int)RX(x5,y5), Y5 = arrowCY + (int)RY(x5,y5);
+
+  TFT_display.fillTriangle(X0,Y0, X1,Y1, X2,Y2, fill);
+  TFT_display.fillTriangle(X3,Y3, X4,Y4, X5,Y5, fill);
+
+  TFT_display.drawTriangle(X0,Y0, X1,Y1, X2,Y2, outline);
+  TFT_display.drawTriangle(X3,Y3, X4,Y4, X5,Y5, outline);
+}
+
+void drawDistanceCard(int distInt) {
+  // Draw a “card” (fixed rectangle) so clearing looks intentional and small
+  TFT_display.fillRect(distBoxX, distBoxY, distBoxW, distBoxH, WHITE);
+  TFT_display.drawRect(distBoxX, distBoxY, distBoxW, distBoxH, BLACK);
 
   TFT_display.setTextColor(BLACK);
   TFT_display.setTextSize(6);
 
   char buf[16];
-  snprintf(buf, sizeof(buf), "%d m", distanceM);
+  snprintf(buf, sizeof(buf), "%d m", distInt);
 
+  // crude centering
   int len = (int)strlen(buf);
   int approxCharW = 6 * 6;
   int textW = len * approxCharW;
-
-  int tx = (w - textW) / 2;
-  int ty = cy + 110;
+  int tx = distBoxX + (distBoxW - textW) / 2;
+  int ty = distBoxY + 8;
 
   TFT_display.setCursor(tx, ty);
   TFT_display.print(buf);
 }
 
+// ---------------- Setup layout ----------------
+void computeLayout() {
+  W = TFT_display.width();
+  H = TFT_display.height();
 
-// Draw a complete screen using the Option A layout
-void drawPathfinderScreen(int w, int h,
-                          bool gpsLock, int sats, float batteryV,
-                          ArrowDir dir, int distanceM,
-                          const char* turnText, int errDeg) {
-  drawStatusBar(w, gpsLock, sats, batteryV);
-  drawMainArea(w, h, dir, distanceM);
-  drawBottomBar(w, h, turnText, errDeg);
+  mainTop = STATUS_H;
+  mainBot = H - BOTTOM_H;
+  mainH   = mainBot - mainTop;
+
+  arrowCX = W / 2;
+  arrowCY = mainTop + (int)(mainH * 0.42f);   // a bit above center
+  arrowSize = (H < 360) ? 170 : 200;          // decent default; tweak if you want
+
+  // Distance box near bottom of main area (doesn't overlap arrow)
+  distBoxW = 260;
+  distBoxH = 70;
+  distBoxX = (W - distBoxW) / 2;
+  distBoxY = mainTop + (int)(mainH * 0.68f);
 }
 
-// ---------------- Arduino Setup/Loop ----------------
+// ---------------- Main loop updates ----------------
+void updateArrowSmooth(float targetAngleDeg) {
+  // Smooth target -> displayed
+  dispAngleDeg = smoothAngleDeg(dispAngleDeg, targetAngleDeg, 0.25f);
+
+  // Only redraw if changed enough (~1 deg)
+  float d = fabsf(angDiffDeg(dispAngleDeg, lastDrawnAngleDeg));
+  if (d > 1.0f) {
+    // Erase old arrow by redrawing it in WHITE (no white rectangle flicker)
+    if (lastDrawnAngleDeg != 9999.0f) {
+      drawArrowRot(lastDrawnAngleDeg, WHITE, WHITE);
+    }
+    // Draw new arrow
+    drawArrowRot(dispAngleDeg, MAGENTA, BLACK);
+
+    lastDrawnAngleDeg = dispAngleDeg;
+  }
+}
+
+void updateDistanceSmooth(float targetDistM) {
+  // Smooth distance (EMA + a little slew limiting)
+  float alpha = 0.18f;
+  float next = dispDistM + alpha * (targetDistM - dispDistM);
+
+  // Slew limit so it glides (meters per update)
+  float maxStep = 1.0f;
+  float step = next - dispDistM;
+  if (step >  maxStep) next = dispDistM + maxStep;
+  if (step < -maxStep) next = dispDistM - maxStep;
+
+  dispDistM = next;
+
+  int distInt = (int)(dispDistM + 0.5f);
+  if (distInt != lastDrawnDistInt) {
+    drawDistanceCard(distInt);
+    lastDrawnDistInt = distInt;
+  }
+}
+
+const char* turnTextFromErr(float errDegSigned) {
+  if (errDegSigned > 15) return "TURN RIGHT";
+  if (errDegSigned < -15) return "TURN LEFT";
+  return "STRAIGHT";
+}
 
 void setup() {
   Monitor.begin(9600);
-  Monitor.println("Pathfinder UI demo (Layout A)");
+  Monitor.println("Pathfinder UI: Smooth 360 Arrow");
 
   TFT_display.begin();
   TFT_display.setRotation(1);   // landscape
   TFT_display.fillScreen(WHITE);
 
-  // If your library supports it, you can set text background:
-  // TFT_display.setTextColor(color, bgColor);
-  // We'll just clear regions before drawing.
+  computeLayout();
+
+  // Draw static UI once
+  drawStatusBar(true, 10, 8.7f);
+  drawBottomBar("STRAIGHT", 0);
+
+  // Initialize smooth values
+  dispAngleDeg = 0.0f;
+  dispDistM = 42.0f;
+
+  // First draw
+  drawArrowRot(dispAngleDeg, MAGENTA, BLACK);
+  lastDrawnAngleDeg = dispAngleDeg;
+
+  drawDistanceCard((int)(dispDistM + 0.5f));
+  lastDrawnDistInt = (int)(dispDistM + 0.5f);
 }
 
 void loop() {
-  // ----- SAMPLE VALUES (replace with real data later) -----
-  static bool gpsLock = true;
-  static int sats = 10;
-  static float batteryV = 8.7;
+  uint32_t now = millis();
 
-  static int distanceM = 42;
-  static int errDeg = +35;
+  // --------------------
+  // DEMO INPUTS (replace)
+  // --------------------
+  // rawErrDeg: -180..+180 (right positive)
+  // rawDistM : meters
+  static float rawErrDeg = 0.0f;
+  static float rawDistM  = 42.0f;
 
-  // Choose arrow direction based on error
-  ArrowDir dir;
-  const char* turnText;
+  // Demo: rotate full 360 and distance decreasing
+  rawErrDeg += 7.0f;
+  if (rawErrDeg > 180.0f) rawErrDeg = -180.0f;
 
-  if (errDeg > 15) {
-    dir = ARROW_RIGHT;
-    turnText = "TURN RIGHT";
-  } else if (errDeg < -15) {
-    dir = ARROW_LEFT;
-    turnText = "TURN LEFT";
-  } else {
-    dir = ARROW_STRAIGHT;
-    turnText = "STRAIGHT";
+  rawDistM -= 0.25f;
+  if (rawDistM < 5.0f) rawDistM = 42.0f;
+
+  // Convert signed error (-180..180) to arrow angle (0..360) where:
+  // 0 = up/forward, 90 = right, 180 = down/back, 270 = left
+  float targetAngleDeg = wrap360(rawErrDeg);
+  float errSigned = wrap180(rawErrDeg);
+
+  // --------------------
+  // Smooth updates
+  // --------------------
+  if (now - tArrow >= ARROW_PERIOD_MS) {
+    tArrow = now;
+    updateArrowSmooth(targetAngleDeg);
   }
 
-  // Screen size: most ILI9486 shields are 480x320 in landscape
-  int w = TFT_display.width();
-  int h = TFT_display.height();
+  if (now - tDist >= DIST_PERIOD_MS) {
+    tDist = now;
+    updateDistanceSmooth(rawDistM);
+  }
 
-  drawPathfinderScreen(w, h, gpsLock, sats, batteryV, dir, distanceM, turnText, errDeg);
+  if (now - tStatus >= STATUS_PERIOD_MS) {
+    tStatus = now;
+    // Replace these with real values later
+    static bool gpsLock = true;
+    static int sats = 10;
+    static float batV = 8.7f;
 
-  // Animate sample values so you can see updates
-  errDeg += 10;
-  if (errDeg > 60) errDeg = -60;
+    // demo variation
+    sats = (sats % 12) + 1;
+    gpsLock = (sats > 3);
 
-  distanceM -= 1;
-  if (distanceM < 5) distanceM = 42;
-
-  sats = (sats % 12) + 1;
-  gpsLock = (sats > 3);
-
-  delay(500);
+    drawStatusBar(gpsLock, sats, batV);
+    drawBottomBar(turnTextFromErr(errSigned), (int)(errSigned >= 0 ? errSigned + 0.5f : errSigned - 0.5f));
+  }
 }
-
