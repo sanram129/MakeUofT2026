@@ -1,20 +1,60 @@
 #include <DIYables_TFT_Shield.h>
 #include <Arduino_RouterBridge.h>
 #include <math.h>
+#include <stdio.h>
 
 DIYables_TFT_ILI9486_Shield TFT;
 
+// Colors
 #define WHITE   DIYables_TFT::colorRGB(255, 255, 255)
 #define BLACK   DIYables_TFT::colorRGB(0, 0, 0)
 #define MAGENTA DIYables_TFT::colorRGB(255, 0, 255)
+#define GREEN   DIYables_TFT::colorRGB(0, 170, 0)
+#define RED     DIYables_TFT::colorRGB(200, 0, 0)
+#define GRAY    DIYables_TFT::colorRGB(230, 230, 230)
+
+static const int STATUS_H = 28;
+static const int MARGIN   = 8;
 
 float prevAngle = NAN;
 
+// ---------------- Status Bar ----------------
+void drawStatusBarFrame() {
+  int W = TFT.width();
+  TFT.fillRect(0, 0, W, STATUS_H, GRAY);
+  TFT.drawLine(0, STATUS_H - 1, W, STATUS_H - 1, BLACK);
+}
+
+void updateStatusBar(bool gpsLock, int sats, float batteryV) {
+  int W = TFT.width();
+
+  TFT.setTextSize(2);
+
+  // Left: GPS
+  TFT.setCursor(MARGIN, 6);
+  TFT.setTextColor(gpsLock ? GREEN : RED, GRAY);
+  TFT.print("GPS: ");
+  TFT.print(gpsLock ? "LOCK" : "--  "); // pad to overwrite
+
+  // Middle: SAT
+  TFT.setCursor(W / 2 - 40, 6);
+  TFT.setTextColor(BLACK, GRAY);
+  TFT.print("SAT:");
+  TFT.print(sats);
+  TFT.print("  ");
+
+  // Right: BAT
+  TFT.setCursor(W - 140, 6);
+  TFT.setTextColor(BLACK, GRAY);
+  TFT.print("BAT:");
+  TFT.print(batteryV, 1);
+  TFT.print("V ");
+}
+
+// ---------------- Arrow Drawing ----------------
 void drawThickLine(int x0, int y0, int x1, int y1, int thickness, uint16_t color) {
-  // Simple thick line: draw several parallel lines
-  // Works well for small thickness (e.g., 3..10)
+  // Simple thick line: multiple parallel lines (fast-ish)
   for (int i = -thickness/2; i <= thickness/2; i++) {
-    // Offset both x and y to make it "thick" in a simple way
     TFT.drawLine(x0 + i, y0, x1 + i, y1, color);
     TFT.drawLine(x0, y0 + i, x1, y1 + i, color);
   }
@@ -23,44 +63,38 @@ void drawThickLine(int x0, int y0, int x1, int y1, int thickness, uint16_t color
 void drawArrow(float angleDeg, uint16_t color) {
   int W = TFT.width();
   int H = TFT.height();
+
+  // Center arrow in MAIN AREA (below status bar)
   int cx = W / 2;
-  int cy = H / 2;
+  int cy = (STATUS_H + H) / 2;   // center of remaining area
 
-  // --- Make it shorter (middle of screen) ---
-  int shaftLen = 70;     // overall arrow length (shorter)
-  int shaftLenBack = 10; // small back extension
-  int thickness = 6;     // thicker shaft
+  // Arrow shape (short + thick)
+  int shaftLen = 70;
+  int shaftLenBack = 10;
+  int thickness = 6;
 
-  // Arrowhead size
   int headLen = 22;
   int headW   = 18;
 
   float th = angleDeg * (3.1415926f / 180.0f);
 
-  // Direction unit vector
   float dx = cosf(th);
   float dy = sinf(th);
 
-  // Perpendicular unit vector
   float px = -dy;
   float py = dx;
 
-  // Tip of arrow
   int xTip = cx + (int)(dx * shaftLen);
   int yTip = cy + (int)(dy * shaftLen);
 
-  // Shaft ends a bit before tip
   int xShaftEnd = cx + (int)(dx * (shaftLen - headLen));
   int yShaftEnd = cy + (int)(dy * (shaftLen - headLen));
 
-  // Shaft start slightly behind center (optional)
   int xShaftStart = cx - (int)(dx * shaftLenBack);
   int yShaftStart = cy - (int)(dy * shaftLenBack);
 
-  // Draw thick shaft
   drawThickLine(xShaftStart, yShaftStart, xShaftEnd, yShaftEnd, thickness, color);
 
-  // Arrowhead triangle
   int xBaseC = xShaftEnd;
   int yBaseC = yShaftEnd;
 
@@ -79,25 +113,49 @@ void setup() {
   TFT.setRotation(1);
   TFT.fillScreen(WHITE);
 
-  // center dot
-  TFT.fillCircle(TFT.width()/2, TFT.height()/2, 3, BLACK);
+  // Static top panel
+  drawStatusBarFrame();
+
+  // Initial values
+  updateStatusBar(false, 0, 0.0f);
+
+  // Center dot (optional) in main area
+  int cx = TFT.width() / 2;
+  int cy = (STATUS_H + TFT.height()) / 2;
+  TFT.fillCircle(cx, cy, 3, BLACK);
 }
 
 void loop() {
   static float angle = 0.0f;
 
-  // erase previous
+  // ---- Demo status values (replace later) ----
+  static int sats = 0;
+  static bool gpsLock = false;
+  static float battV = 8.7f;
+
+  // Update status slower than arrow
+  static uint32_t lastStatus = 0;
+  if (millis() - lastStatus > 500) {
+    lastStatus = millis();
+
+    sats = (sats % 12) + 1;
+    gpsLock = (sats > 3);
+
+    updateStatusBar(gpsLock, sats, battV);
+  }
+
+  // Erase previous arrow
   if (!isnan(prevAngle)) {
     drawArrow(prevAngle, WHITE);
   }
 
-  // draw current
+  // Draw new arrow
   drawArrow(angle, MAGENTA);
   prevAngle = angle;
 
-  // update angle
-  angle += 3.0f;          // speed (try 1..6)
+  // Advance angle
+  angle += 3.0f;
   if (angle >= 360.0f) angle -= 360.0f;
 
-  delay(25);              // smoothness (try 15..40)
+  delay(25);
 }
