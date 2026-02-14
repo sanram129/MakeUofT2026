@@ -10,21 +10,66 @@ DIYables_TFT_ILI9486_Shield TFT;
 
 float prevAngle = NAN;
 
-void drawLineAtAngle(float angleDeg, uint16_t color) {
+void drawThickLine(int x0, int y0, int x1, int y1, int thickness, uint16_t color) {
+  // Simple thick line: draw several parallel lines
+  // Works well for small thickness (e.g., 3..10)
+  for (int i = -thickness/2; i <= thickness/2; i++) {
+    // Offset both x and y to make it "thick" in a simple way
+    TFT.drawLine(x0 + i, y0, x1 + i, y1, color);
+    TFT.drawLine(x0, y0 + i, x1, y1 + i, color);
+  }
+}
+
+void drawArrow(float angleDeg, uint16_t color) {
   int W = TFT.width();
   int H = TFT.height();
-
   int cx = W / 2;
   int cy = H / 2;
 
-  int r = (min(W, H) / 2) - 20;  // radius / length
+  // --- Make it shorter (middle of screen) ---
+  int shaftLen = 70;     // overall arrow length (shorter)
+  int shaftLenBack = 10; // small back extension
+  int thickness = 6;     // thicker shaft
+
+  // Arrowhead size
+  int headLen = 22;
+  int headW   = 18;
 
   float th = angleDeg * (3.1415926f / 180.0f);
 
-  int x2 = cx + (int)(r * cosf(th));
-  int y2 = cy + (int)(r * sinf(th));
+  // Direction unit vector
+  float dx = cosf(th);
+  float dy = sinf(th);
 
-  TFT.drawLine(cx, cy, x2, y2, color);
+  // Perpendicular unit vector
+  float px = -dy;
+  float py = dx;
+
+  // Tip of arrow
+  int xTip = cx + (int)(dx * shaftLen);
+  int yTip = cy + (int)(dy * shaftLen);
+
+  // Shaft ends a bit before tip
+  int xShaftEnd = cx + (int)(dx * (shaftLen - headLen));
+  int yShaftEnd = cy + (int)(dy * (shaftLen - headLen));
+
+  // Shaft start slightly behind center (optional)
+  int xShaftStart = cx - (int)(dx * shaftLenBack);
+  int yShaftStart = cy - (int)(dy * shaftLenBack);
+
+  // Draw thick shaft
+  drawThickLine(xShaftStart, yShaftStart, xShaftEnd, yShaftEnd, thickness, color);
+
+  // Arrowhead triangle
+  int xBaseC = xShaftEnd;
+  int yBaseC = yShaftEnd;
+
+  int xL = xBaseC + (int)(px * (headW / 2));
+  int yL = yBaseC + (int)(py * (headW / 2));
+  int xR = xBaseC - (int)(px * (headW / 2));
+  int yR = yBaseC - (int)(py * (headW / 2));
+
+  TFT.fillTriangle(xTip, yTip, xL, yL, xR, yR, color);
 }
 
 void setup() {
@@ -34,27 +79,25 @@ void setup() {
   TFT.setRotation(1);
   TFT.fillScreen(WHITE);
 
-  // optional center mark
-  int cx = TFT.width() / 2;
-  int cy = TFT.height() / 2;
-  TFT.fillCircle(cx, cy, 3, BLACK);
+  // center dot
+  TFT.fillCircle(TFT.width()/2, TFT.height()/2, 3, BLACK);
 }
 
 void loop() {
   static float angle = 0.0f;
 
-  // erase old line
+  // erase previous
   if (!isnan(prevAngle)) {
-    drawLineAtAngle(prevAngle, WHITE);
+    drawArrow(prevAngle, WHITE);
   }
 
-  // draw new line
-  drawLineAtAngle(angle, MAGENTA);
+  // draw current
+  drawArrow(angle, MAGENTA);
   prevAngle = angle;
 
-  // advance angle
-  angle += 3.0f;         // change this for speed (try 1.0..6.0)
+  // update angle
+  angle += 3.0f;          // speed (try 1..6)
   if (angle >= 360.0f) angle -= 360.0f;
 
-  delay(25);             // change this for smoothness (try 15..35)
+  delay(25);              // smoothness (try 15..40)
 }
