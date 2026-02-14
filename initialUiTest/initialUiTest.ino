@@ -26,76 +26,79 @@ static const int STATUS_H = 30;
 static const int BOTTOM_H = 50;
 static const int MARGIN   = 10;
 
-// Simple arrow direction enum
 enum ArrowDir { ARROW_STRAIGHT, ARROW_LEFT, ARROW_RIGHT };
 
-// ---------------- Drawing Helpers ----------------
+void drawArrow(int cx, int cy, int size, ArrowDir dir, uint16_t fill, uint16_t outline = 0xFFFF, bool doOutline=false) {
+  // proportions you can tweak
+  int headLen = (int)(size * 0.45);   // head length
+  int headHalfW = (int)(size * 0.28); // half head width
+  int shaftThick = (int)(size * 0.18);// shaft thickness
 
-// Draw a filled, simple arrow using triangles/rectangles (no fancy fonts needed)
-void drawArrow(int cx, int cy, int size, ArrowDir dir, uint16_t color) {
-  // We draw a "UP" arrow in local coordinates then rotate by choosing point sets.
-  // Use simple shapes: a shaft rectangle + a head triangle.
-  int shaftW = size / 4;         // thickness
-  int shaftH = (size * 3) / 5;   // length
-  int headH  = (size * 2) / 5;   // head height
-  int headW  = size;             // head width
+  // constrain (avoid 0)
+  if (shaftThick < 4) shaftThick = 4;
+  if (headHalfW < 6) headHalfW = 6;
 
-  // For each direction we map to screen coords.
-  // Local "UP" arrow parts:
-  // Shaft: centered at (0, +headH/2) downwards
-  // Head triangle: tip at (0, -size/2)
-  // A) Straight (UP)
-  if (dir == ARROW_STRAIGHT) {
-    // Shaft rectangle
-    int x0 = cx - shaftW / 2;
-    int y0 = cy - (shaftH / 2) + headH / 2;
-    TFT_display.fillRect(x0, y0, shaftW, shaftH, color);
+  if (dir == ARROW_LEFT) {
+    int xTip  = cx - size/2;
+    int xBase = xTip + headLen;
+    int xEnd  = cx + size/2;
 
-    // Head triangle
-    int tipX = cx;
-    int tipY = cy - size / 2;
-    int leftX = cx - headW / 2;
-    int leftY = cy - size / 2 + headH;
-    int rightX = cx + headW / 2;
-    int rightY = cy - size / 2 + headH;
+    // head triangle
+    TFT_display.fillTriangle(xTip, cy,
+                             xBase, cy - headHalfW,
+                             xBase, cy + headHalfW,
+                             fill);
 
-    TFT_display.fillTriangle(tipX, tipY, leftX, leftY, rightX, rightY, color);
+    // shaft
+    TFT_display.fillRect(xBase, cy - shaftThick/2,
+                         xEnd - xBase, shaftThick,
+                         fill);
+
+    if (doOutline) {
+      TFT_display.drawTriangle(xTip, cy, xBase, cy - headHalfW, xBase, cy + headHalfW, outline);
+      TFT_display.drawRect(xBase, cy - shaftThick/2, xEnd - xBase, shaftThick, outline);
+    }
   }
-  // B) Left (arrow points LEFT)
-  else if (dir == ARROW_LEFT) {
-    // Shaft rectangle (horizontal)
-    int x0 = cx - (shaftH / 2) - headH / 2;
-    int y0 = cy - shaftW / 2;
-    TFT_display.fillRect(x0, y0, shaftH, shaftW, color);
+  else if (dir == ARROW_RIGHT) {
+    int xTip  = cx + size/2;
+    int xBase = xTip - headLen;
+    int xEnd  = cx - size/2;
 
-    // Head triangle pointing left
-    int tipX = cx - size / 2;
-    int tipY = cy;
-    int topX = cx - size / 2 + headH;
-    int topY = cy - headW / 2;
-    int botX = cx - size / 2 + headH;
-    int botY = cy + headW / 2;
+    TFT_display.fillTriangle(xTip, cy,
+                             xBase, cy - headHalfW,
+                             xBase, cy + headHalfW,
+                             fill);
 
-    TFT_display.fillTriangle(tipX, tipY, topX, topY, botX, botY, color);
+    TFT_display.fillRect(xEnd, cy - shaftThick/2,
+                         xBase - xEnd, shaftThick,
+                         fill);
+
+    if (doOutline) {
+      TFT_display.drawTriangle(xTip, cy, xBase, cy - headHalfW, xBase, cy + headHalfW, outline);
+      TFT_display.drawRect(xEnd, cy - shaftThick/2, xBase - xEnd, shaftThick, outline);
+    }
   }
-  // C) Right (arrow points RIGHT)
-  else {
-    // Shaft rectangle (horizontal)
-    int x0 = cx - (shaftH / 2) + headH / 2;
-    int y0 = cy - shaftW / 2;
-    TFT_display.fillRect(x0, y0, shaftH, shaftW, color);
+  else { // ARROW_STRAIGHT (UP)
+    int yTip  = cy - size/2;
+    int yBase = yTip + headLen;
+    int yEnd  = cy + size/2;
 
-    // Head triangle pointing right
-    int tipX = cx + size / 2;
-    int tipY = cy;
-    int topX = cx + size / 2 - headH;
-    int topY = cy - headW / 2;
-    int botX = cx + size / 2 - headH;
-    int botY = cy + headW / 2;
+    TFT_display.fillTriangle(cx, yTip,
+                             cx - headHalfW, yBase,
+                             cx + headHalfW, yBase,
+                             fill);
 
-    TFT_display.fillTriangle(tipX, tipY, topX, topY, botX, botY, color);
+    TFT_display.fillRect(cx - shaftThick/2, yBase,
+                         shaftThick, yEnd - yBase,
+                         fill);
+
+    if (doOutline) {
+      TFT_display.drawTriangle(cx, yTip, cx - headHalfW, yBase, cx + headHalfW, yBase, outline);
+      TFT_display.drawRect(cx - shaftThick/2, yBase, shaftThick, yEnd - yBase, outline);
+    }
   }
 }
+
 
 void drawStatusBar(int w, bool gpsLock, int sats, float batteryV) {
   // Background
@@ -152,26 +155,22 @@ void drawMainArea(int w, int h, ArrowDir dir, int distanceM) {
   int yBot = h - BOTTOM_H;
   int areaH = yBot - yTop;
 
-  // Clear main area
   TFT_display.fillRect(0, yTop, w, areaH, WHITE);
 
-  // Arrow center
   int cx = w / 2;
   int cy = yTop + areaH / 2 - 40;
 
-  // Draw arrow
-  drawArrow(cx, cy, 180, dir, MAGENTA);
+  //  Use the computed direction
+  drawArrow(cx, cy, 160, dir, MAGENTA, BLACK, true);
 
-  // Distance big text under arrow
   TFT_display.setTextColor(BLACK);
   TFT_display.setTextSize(6);
 
-  // Rough centering (monospace-ish estimate): each char ~6*textSize pixels wide.
-  // We'll compute a simple width estimate for "### m"
   char buf[16];
   snprintf(buf, sizeof(buf), "%d m", distanceM);
+
   int len = (int)strlen(buf);
-  int approxCharW = 6 * 6; // base font ~6px wide * textSize(6)
+  int approxCharW = 6 * 6;
   int textW = len * approxCharW;
 
   int tx = (w - textW) / 2;
@@ -180,6 +179,7 @@ void drawMainArea(int w, int h, ArrowDir dir, int distanceM) {
   TFT_display.setCursor(tx, ty);
   TFT_display.print(buf);
 }
+
 
 // Draw a complete screen using the Option A layout
 void drawPathfinderScreen(int w, int h,
