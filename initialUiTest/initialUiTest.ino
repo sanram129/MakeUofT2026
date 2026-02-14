@@ -14,6 +14,57 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+// Common MCUFRIEND-style mapping (matches many 3.5" UNO shields)
+#define LCD_RD  A0
+#define LCD_WR  A1
+#define LCD_RS  A2
+#define LCD_CS  A3
+#define LCD_RST A4
+
+#define LCD_D0  8
+#define LCD_D1  9
+#define LCD_D2  2
+#define LCD_D3  3
+#define LCD_D4  4
+#define LCD_D5  5
+#define LCD_D6  6
+#define LCD_D7  7
+
+// Touch pins (usually shared with some of the above)
+#define TP_XP  8   /
+void tftBusTakeoverForTouch() {
+  pinMode(LCD_CS, OUTPUT);
+  digitalWrite(LCD_CS, HIGH);   // deselect TFT
+
+  pinMode(LCD_RD, OUTPUT);
+  digitalWrite(LCD_RD, HIGH);
+
+  pinMode(LCD_WR, OUTPUT);
+  digitalWrite(LCD_WR, HIGH);
+}
+
+void tftBusRestoreAfterTouch() {
+  // restore control pins
+  pinMode(LCD_CS, OUTPUT);  digitalWrite(LCD_CS, LOW);   // reselect TFT (safe default)
+  pinMode(LCD_RS, OUTPUT);
+  pinMode(LCD_RD, OUTPUT);  digitalWrite(LCD_RD, HIGH);
+  pinMode(LCD_WR, OUTPUT);  digitalWrite(LCD_WR, HIGH);
+  pinMode(LCD_RST, OUTPUT); digitalWrite(LCD_RST, HIGH);
+
+  // restore data bus pins
+  pinMode(LCD_D0, OUTPUT);
+  pinMode(LCD_D1, OUTPUT);
+  pinMode(LCD_D2, OUTPUT);
+  pinMode(LCD_D3, OUTPUT);
+  pinMode(LCD_D4, OUTPUT);
+  pinMode(LCD_D5, OUTPUT);
+  pinMode(LCD_D6, OUTPUT);
+  pinMode(LCD_D7, OUTPUT);
+}
+/ same as LCD_D0
+#define TP_YM  9   // same as LCD_D1
+#define TP_XM  A2  // same as LCD_RS
+#define TP_YP  A3  // same as LCD_CS
 
 // ---------------- Colors ----------------
 #define WHITE     DIYables_TFT::colorRGB(255, 255, 255)
@@ -250,7 +301,13 @@ void updateArrow(float newAngleDeg) {
 
 // ---------------- Touch reading (raw resistive) ----------------
 bool readTouchRaw(int &rx, int &ry) {
-  // Read X (use YP as ADC)
+  static uint32_t lastPoll = 0;
+  if (millis() - lastPoll < 60) return false;  // throttle polling (buttons don’t need 60fps)
+  lastPoll = millis();
+
+  tftBusTakeoverForTouch();
+
+  // Read X
   pinMode(TP_YP, INPUT);
   pinMode(TP_YM, INPUT);
   pinMode(TP_XP, OUTPUT);
@@ -260,7 +317,7 @@ bool readTouchRaw(int &rx, int &ry) {
   delayMicroseconds(30);
   rx = analogRead(TP_YP);
 
-  // Read Y (use XM as ADC)
+  // Read Y
   pinMode(TP_XP, INPUT);
   pinMode(TP_XM, INPUT);
   pinMode(TP_YP, OUTPUT);
@@ -270,16 +327,13 @@ bool readTouchRaw(int &rx, int &ry) {
   delayMicroseconds(30);
   ry = analogRead(TP_XM);
 
-  // Release pins
-  pinMode(TP_XP, INPUT);
-  pinMode(TP_XM, INPUT);
-  pinMode(TP_YP, INPUT);
-  pinMode(TP_YM, INPUT);
+  tftBusRestoreAfterTouch();
 
-  // Basic “is it touched?” heuristic: ignore extreme values
-  if (rx < 50 || ry < 50 || rx > 4090 || ry > 4090) return false;
+  // crude “pressed?” check (tune later with calibration)
+  if (rx < 50 || ry < 50) return false;
   return true;
 }
+
 
 bool readTouchScreen(int &sx, int &sy) {
   int rx, ry;
