@@ -1,186 +1,345 @@
 /*
-  Pathfinder UI: Smooth 0–360 Arrow + Smooth Distance (FAST)
-  Arduino UNO Q + DIYables_TFT_ILI9486_Shield
+  Pathfinder UI + Touch Buttons (UNO Q + 3.5" ILI9486 Shield)
+  - Two on-screen buttons: SET HOME / CLEAR HOME
+  - CLEAR HOME -> distance = 0.0m and bottom message: "NO HOME SET"
+  - Uses resistive 4-wire touch WITHOUT TouchScreen.h (avoids pins_arduino issues)
 
-  Replace demo inputs with real nav later:
-    targetAngleDeg = wrap360(bearingToHomeDeg - headingDeg);  // 0..360
-    targetDistM    = distanceToHomeMeters;
+  IMPORTANT:
+  1) Touch pin mapping depends on your shield. Defaults below are common for many 3.5" UNO shields.
+  2) Calibrate TS_MIN/TS_MAX values using the debug prints (tap corners).
 */
 
 #include <DIYables_TFT_Shield.h>
 #include <Arduino_RouterBridge.h>
-
 #include <math.h>
-#include <string.h>
 #include <stdio.h>
+#include <string.h>
 
-// Colors
+// ---------------- Colors ----------------
 #define WHITE     DIYables_TFT::colorRGB(255, 255, 255)
 #define BLACK     DIYables_TFT::colorRGB(0, 0, 0)
 #define MAGENTA   DIYables_TFT::colorRGB(255, 0, 255)
 #define GREEN     DIYables_TFT::colorRGB(0, 170, 0)
 #define RED       DIYables_TFT::colorRGB(200, 0, 0)
 #define GRAY      DIYables_TFT::colorRGB(230, 230, 230)
+#define BLUE      DIYables_TFT::colorRGB(40, 90, 255)
+#define ORANGE    DIYables_TFT::colorRGB(255, 140, 40)
 
-DIYables_TFT_ILI9486_Shield TFT_display;
+DIYables_TFT_ILI9486_Shield TFT;
 
-// UI
-static const int STATUS_H = 30;
-static const int BOTTOM_H = 50;
-static const int MARGIN   = 10;
+// ---------------- Layout ----------------
+static const int STATUS_H = 28;
+static const int BOTTOM_H = 48;
+static const int MARGIN   = 8;
 
-// Screen/layout
-static int W, H;
-static int mainTop, mainBot, mainH;
-static int arrowCX, arrowCY;
-static int ARROW_SIZE = 110;      // smaller (tweak 90..140)
-static int distBoxX, distBoxY, distBoxW, distBoxH;
+int W, H;
+int mainTop, mainBot, mainH;
 
-// Timing (fast + smooth)
-static const uint32_t UI_MS      = 16;   // ~60 FPS
-static const uint32_t STATUS_MS  = 500;  // slow status redraw
-static uint32_t tUI = 0, tStatus = 0;
+int arrowCX, arrowCY;
+int ARROW_LEN = 48;     // smaller arrow (tweak 40..65)
+int ARROW_W   = 28;
 
-// Displayed (smoothed) values
-static float dispAngle = 0.0f;   // 0..360
-static float dispDist  = 41.0f;  // meters
+int distBoxX, distBoxY, distBoxW, distBoxH;
+int distTextX, distTextY;
 
-// Last drawn
-static float lastDrawAngle = 9999.0f;
-static int   lastDistTenth = -9999;
+// Buttons (in main area, above bottom panel)
+struct Btn {
+  int x, y, w, h;
+  const char* label;
+  uint16_t fill, border, text;
+};
+Btn btnSet, btnClear;
 
-// ---------- Helpers ----------
-static inline float wrap360(float a){
+// ---------------- Touch configuration ----------------
+// These are COMMON for many MCUFRIEND-style 3.5" shields.
+// If your touch doesn't respond, you may need to change these.
+#define TP_XP 8      // digital
+#define TP_YM 9      // digital
+#define TP_XM A2     // analog
+#define TP_YP A3     // analog
+
+// Calibration: print raw values (Monitor) and adjust.
+// Start with these guesses, then tune:
+int TS_MINX = 350;
+int TS_MAXX = 3800;
+int TS_MINY = 350;
+int TS_MAXY = 3800;
+
+// If touch is rotated/flipped, change these (try combos):
+#define TOUCH_SWAP_XY   1
+#define TOUCH_INVERT_X  1
+#define TOUCH_INVERT_Y  0
+
+// Debounce
+bool touchDown = false;
+uint32_t lastTouchMs = 0;
+
+// ---------------- App state ----------------
+bool homeSet = false;
+
+// “Navigation outputs” (replace later with real compass+GPS)
+float targetAngleDeg = 0.0f;   // 0..360, 0=up
+float targetDistM    = 0.0f;
+
+// Smoothed display values
+float shownAngleDeg = 0.0f;
+float shownDistM    = 0.0f;
+
+float prevArrowAngle = NAN;    // for erase-by-redraw
+int   lastDistTenth  = -99999; // update distance at 0.1m steps
+
+// Timing
+uint32_t tUI = 0, tBars = 0;
+static const uint32_t UI_MS   = 35;   // ~28 FPS (increase if too slow)
+static const uint32_t BARS_MS = 400;
+
+// ---------------- Helpers ----------------
+static inline float wrap360(float a) {
   while (a < 0) a += 360.0f;
   while (a >= 360.0f) a -= 360.0f;
   return a;
 }
-static inline float wrap180(float a){
+static inline float wrap180(float a) {
   a = wrap360(a);
   if (a > 180.0f) a -= 360.0f;
   return a;
 }
-static inline float angDiff(float target, float current){
-  return wrap180(target - current);  // shortest signed diff
+static inline float angDiff(float target, float current) {
+  return wrap180(target - current); // shortest signed delta [-180..180]
 }
-static inline float clampf(float x, float lo, float hi){
+static inline float clampf(float x, float lo, float hi) {
   if (x < lo) return lo;
   if (x > hi) return hi;
   return x;
 }
-
-// ---------- Bars ----------
-void drawStatusBar(bool gpsLock, int sats, float batteryV) {
-  TFT_display.fillRect(0, 0, W, STATUS_H, GRAY);
-  TFT_display.drawLine(0, STATUS_H - 1, W, STATUS_H - 1, BLACK);
-
-  TFT_display.setTextSize(2);
-
-  TFT_display.setCursor(MARGIN, 6);
-  if (gpsLock) { TFT_display.setTextColor(GREEN); TFT_display.print("GPS: LOCK"); }
-  else         { TFT_display.setTextColor(RED);   TFT_display.print("GPS: --");   }
-
-  TFT_display.setTextColor(BLACK);
-  TFT_display.setCursor(W/2 - 55, 6);
-  TFT_display.print("SAT: ");
-  TFT_display.print(sats);
-
-  TFT_display.setCursor(W - 150, 6);
-  TFT_display.print("BAT: ");
-  TFT_display.print(batteryV, 1);
-  TFT_display.print("V");
+static long mapLong(long x, long in_min, long in_max, long out_min, long out_max) {
+  if (in_max == in_min) return out_min;
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+static bool inRect(int px, int py, const Btn& b) {
+  return (px >= b.x && px < b.x + b.w && py >= b.y && py < b.y + b.h);
 }
 
-const char* turnTextFromErr(float errDegSigned){
-  if (errDegSigned > 15) return "TURN RIGHT";
-  if (errDegSigned < -15) return "TURN LEFT";
-  return "STRAIGHT";
+// ---------------- Drawing: Bars ----------------
+void drawStatusBar(bool gpsLock, int sats, float battV) {
+  TFT.fillRect(0, 0, W, STATUS_H, GRAY);
+  TFT.drawLine(0, STATUS_H - 1, W, STATUS_H - 1, BLACK);
+
+  TFT.setTextSize(2);
+
+  TFT.setCursor(MARGIN, 6);
+  TFT.setTextColor(gpsLock ? GREEN : RED, GRAY);
+  TFT.print("GPS: ");
+  TFT.print(gpsLock ? "LOCK" : "--  ");
+
+  TFT.setCursor(W/2 - 40, 6);
+  TFT.setTextColor(BLACK, GRAY);
+  TFT.print("SAT:");
+  TFT.print(sats);
+  TFT.print("  ");
+
+  TFT.setCursor(W - 140, 6);
+  TFT.print("BAT:");
+  TFT.print(battV, 1);
+  TFT.print("V ");
 }
 
-void drawBottomBar(float errDegSigned) {
+void drawBottomBarMessage(const char* msg, int errDegSigned) {
   int y0 = H - BOTTOM_H;
-  TFT_display.fillRect(0, y0, W, BOTTOM_H, GRAY);
-  TFT_display.drawLine(0, y0, W, y0, BLACK);
+  TFT.fillRect(0, y0, W, BOTTOM_H, GRAY);
+  TFT.drawLine(0, y0, W, y0, BLACK);
 
-  TFT_display.setTextSize(3);
-  TFT_display.setTextColor(MAGENTA);
-  TFT_display.setCursor(MARGIN, y0 + 10);
-  TFT_display.print(turnTextFromErr(errDegSigned));
+  TFT.setTextSize(3);
+  TFT.setCursor(MARGIN, y0 + 12);
+  TFT.setTextColor(MAGENTA, GRAY);
+  TFT.print(msg);
+  TFT.print("     ");
 
-  TFT_display.setTextSize(2);
-  TFT_display.setTextColor(BLACK);
-  TFT_display.setCursor(W - 170, y0 + 18);
-  TFT_display.print("ERR ");
-  int errInt = (int)(errDegSigned >= 0 ? errDegSigned + 0.5f : errDegSigned - 0.5f);
-  if (errInt >= 0) TFT_display.print("+");
-  TFT_display.print(errInt);
-  TFT_display.print((char)247);
+  TFT.setTextSize(2);
+  TFT.setCursor(W - 155, y0 + 16);
+  TFT.setTextColor(BLACK, GRAY);
+  TFT.print("ERR ");
+  if (errDegSigned >= 0) TFT.print("+");
+  TFT.print(errDegSigned);
+  TFT.print((char)247);
+  TFT.print("   ");
 }
 
-// ---------- Arrow (FAST) ----------
-// Single filled triangle arrow. 0° = up, 90° = right, 180° = down.
-void drawArrowTriangle(float angleDeg, uint16_t color) {
-  float rad = angleDeg * 3.1415926f / 180.0f;
+// ---------------- Drawing: Buttons ----------------
+void drawButton(const Btn& b) {
+  TFT.fillRect(b.x, b.y, b.w, b.h, b.fill);
+  TFT.drawRect(b.x, b.y, b.w, b.h, b.border);
 
-  // local triangle points (pointing up at 0°)
-  float L = ARROW_SIZE * 0.70f;      // length
-  float Wd = ARROW_SIZE * 0.45f;     // width
+  TFT.setTextSize(2);
+  TFT.setTextColor(b.text, b.fill);
 
-  float x0 = 0.0f,    y0 = -L;       // tip
-  float x1 = -Wd/2.f, y1 =  L*0.35f; // left base
-  float x2 =  Wd/2.f, y2 =  L*0.35f; // right base
+  // Rough centering
+  int labelLen = (int)strlen(b.label);
+  int approxCharW = 6 * 2;
+  int textW = labelLen * approxCharW;
+  int tx = b.x + (b.w - textW) / 2;
+  int ty = b.y + (b.h - 16) / 2;
 
-  auto RX = [&](float x, float y){ return x*cosf(rad) - y*sinf(rad); };
-  auto RY = [&](float x, float y){ return x*sinf(rad) + y*cosf(rad); };
-
-  int X0 = arrowCX + (int)RX(x0,y0), Y0 = arrowCY + (int)RY(x0,y0);
-  int X1 = arrowCX + (int)RX(x1,y1), Y1 = arrowCY + (int)RY(x1,y1);
-  int X2 = arrowCX + (int)RX(x2,y2), Y2 = arrowCY + (int)RY(x2,y2);
-
-  TFT_display.fillTriangle(X0,Y0, X1,Y1, X2,Y2, color);
+  TFT.setCursor(tx, ty);
+  TFT.print(b.label);
 }
 
-// Erase old arrow by drawing same triangle in WHITE (no rectangle wipe!)
-void eraseArrow(float angleDeg) {
-  drawArrowTriangle(angleDeg, WHITE);
+void flashButton(const Btn& b) {
+  // Quick visual feedback
+  TFT.drawRect(b.x, b.y, b.w, b.h, BLACK);
+  delay(60);
+  TFT.drawRect(b.x, b.y, b.w, b.h, b.border);
 }
 
-// ---------- Distance box ----------
-void drawDistanceBoxFrame() {
-  TFT_display.drawRect(distBoxX, distBoxY, distBoxW, distBoxH, BLACK);
+// ---------------- Drawing: Distance ----------------
+void drawDistanceFrame() {
+  TFT.drawRect(distBoxX, distBoxY, distBoxW, distBoxH, BLACK);
 }
 
-void drawDistanceValue(float meters) {
-  // Update at 0.1 m resolution for “smooth”
+void updateDistanceText(float meters) {
   int tenth = (int)(meters * 10.0f + 0.5f);
   if (tenth == lastDistTenth) return;
   lastDistTenth = tenth;
 
-  // Clear only INSIDE the box (small area)
-  TFT_display.fillRect(distBoxX+2, distBoxY+2, distBoxW-4, distBoxH-4, WHITE);
+  // Overwrite text with WHITE background (NO big rectangle clear)
+  TFT.setTextSize(5);
+  TFT.setTextColor(BLACK, WHITE);
+  TFT.setCursor(distTextX, distTextY);
 
-  TFT_display.setTextColor(BLACK);
-  TFT_display.setTextSize(6);
-
-  char buf[16];
-  // show 1 decimal for smoother feel: "51.2 m"
-  snprintf(buf, sizeof(buf), "%.1f m", meters);
-
-  // crude centering
-  int len = (int)strlen(buf);
-  int approxCharW = 6 * 6;
-  int textW = len * approxCharW;
-  int tx = distBoxX + (distBoxW - textW) / 2;
-  int ty = distBoxY + 8;
-
-  TFT_display.setCursor(tx, ty);
-  TFT_display.print(buf);
+  char buf[18];
+  // Fixed width helps erase old longer numbers
+  snprintf(buf, sizeof(buf), "%6.1f m", meters);
+  TFT.print(buf);
 }
 
-// ---------- Layout ----------
+// ---------------- Drawing: Arrow ----------------
+// Triangle arrow, 0°=UP, 90°=RIGHT, 180°=DOWN, 270°=LEFT
+void drawArrow(float angleDeg, uint16_t color) {
+  float th = angleDeg * (3.1415926f / 180.0f);
+
+  float dx = sinf(th);
+  float dy = -cosf(th);
+
+  float px = cosf(th);
+  float py = sinf(th);
+
+  int xTip = (int)(arrowCX + dx * ARROW_LEN);
+  int yTip = (int)(arrowCY + dy * ARROW_LEN);
+
+  float back = ARROW_LEN * 0.45f;
+  int xBaseC = (int)(arrowCX - dx * back);
+  int yBaseC = (int)(arrowCY - dy * back);
+
+  int halfW = ARROW_W / 2;
+  int xL = (int)(xBaseC - px * halfW);
+  int yL = (int)(yBaseC - py * halfW);
+  int xR = (int)(xBaseC + px * halfW);
+  int yR = (int)(yBaseC + py * halfW);
+
+  TFT.fillTriangle(xTip, yTip, xL, yL, xR, yR, color);
+}
+
+void updateArrow(float newAngleDeg) {
+  // Erase old arrow by drawing it again in WHITE (smallest possible erase)
+  if (!isnan(prevArrowAngle)) {
+    drawArrow(prevArrowAngle, WHITE);
+  }
+  drawArrow(newAngleDeg, MAGENTA);
+  prevArrowAngle = newAngleDeg;
+}
+
+// ---------------- Touch reading (raw resistive) ----------------
+bool readTouchRaw(int &rx, int &ry) {
+  // Read X (use YP as ADC)
+  pinMode(TP_YP, INPUT);
+  pinMode(TP_YM, INPUT);
+  pinMode(TP_XP, OUTPUT);
+  pinMode(TP_XM, OUTPUT);
+  digitalWrite(TP_XP, LOW);
+  digitalWrite(TP_XM, HIGH);
+  delayMicroseconds(30);
+  rx = analogRead(TP_YP);
+
+  // Read Y (use XM as ADC)
+  pinMode(TP_XP, INPUT);
+  pinMode(TP_XM, INPUT);
+  pinMode(TP_YP, OUTPUT);
+  pinMode(TP_YM, OUTPUT);
+  digitalWrite(TP_YP, HIGH);
+  digitalWrite(TP_YM, LOW);
+  delayMicroseconds(30);
+  ry = analogRead(TP_XM);
+
+  // Release pins
+  pinMode(TP_XP, INPUT);
+  pinMode(TP_XM, INPUT);
+  pinMode(TP_YP, INPUT);
+  pinMode(TP_YM, INPUT);
+
+  // Basic “is it touched?” heuristic: ignore extreme values
+  if (rx < 50 || ry < 50 || rx > 4090 || ry > 4090) return false;
+  return true;
+}
+
+bool readTouchScreen(int &sx, int &sy) {
+  int rx, ry;
+  if (!readTouchRaw(rx, ry)) return false;
+
+  // Map raw to screen coords
+  long x = mapLong(rx, TS_MINX, TS_MAXX, 0, W - 1);
+  long y = mapLong(ry, TS_MINY, TS_MAXY, 0, H - 1);
+
+  // Apply orientation fixes
+#if TOUCH_SWAP_XY
+  long t = x; x = y; y = t;
+#endif
+#if TOUCH_INVERT_X
+  x = (W - 1) - x;
+#endif
+#if TOUCH_INVERT_Y
+  y = (H - 1) - y;
+#endif
+
+  // Clamp
+  if (x < 0) x = 0; if (x >= W) x = W - 1;
+  if (y < 0) y = 0; if (y >= H) y = H - 1;
+
+  sx = (int)x;
+  sy = (int)y;
+  return true;
+}
+
+// ---------------- App actions ----------------
+void setHomeAction() {
+  homeSet = true;
+  // In your real code, store current GPS lat/lon as HOME here.
+
+  // UI: keep distance as-is (or set to current)
+  drawBottomBarMessage("HOME SET", 0);
+}
+
+void clearHomeAction() {
+  homeSet = false;
+
+  // distance must become 0 and message "NO HOME SET"
+  targetDistM = 0.0f;
+  shownDistM  = 0.0f;
+  lastDistTenth = -99999;
+  updateDistanceText(0.0f);
+
+  // remove arrow (erase last arrow once)
+  if (!isnan(prevArrowAngle)) {
+    drawArrow(prevArrowAngle, WHITE);
+    prevArrowAngle = NAN;
+  }
+
+  drawBottomBarMessage("NO HOME SET", 0);
+}
+
+// ---------------- Layout init ----------------
 void computeLayout() {
-  W = TFT_display.width();
-  H = TFT_display.height();
+  W = TFT.width();
+  H = TFT.height();
 
   mainTop = STATUS_H;
   mainBot = H - BOTTOM_H;
@@ -189,100 +348,145 @@ void computeLayout() {
   arrowCX = W / 2;
   arrowCY = mainTop + (int)(mainH * 0.40f);
 
-  // distance box
-  distBoxW = 300;
-  distBoxH = 70;
+  // Distance box
+  distBoxW = (int)(W * 0.70f);
+  distBoxH = 60;
   distBoxX = (W - distBoxW) / 2;
-  distBoxY = mainTop + (int)(mainH * 0.68f);
+  distBoxY = arrowCY + 35;
+
+  distTextX = distBoxX + 18;
+  distTextY = distBoxY + 16;
+
+  // Buttons row (near bottom of main area)
+  int btnY = mainBot - 44;      // above bottom bar
+  int btnW = (W - 3*MARGIN) / 2;
+  int btnH = 36;
+
+  btnSet = { MARGIN, btnY, btnW, btnH, "SET HOME",  BLUE,   BLACK, WHITE };
+  btnClear = { MARGIN + btnW + MARGIN, btnY, btnW, btnH, "CLEAR", ORANGE, BLACK, BLACK };
 }
 
-// ---------- Smooth stepping (slew-limited) ----------
-void stepAngleToward(float targetDeg) {
-  // move smoothly using shortest path
-  float d = angDiff(targetDeg, dispAngle);
-  float maxStep = 3.0f;               // degrees per frame (~180°/sec at 60fps)
-  d = clampf(d, -maxStep, maxStep);
-  dispAngle = wrap360(dispAngle + d);
+// Draw static UI once
+void drawStaticUI() {
+  TFT.fillScreen(WHITE);
+
+  // bars
+  drawStatusBar(true, 0, 0.0f);
+  drawBottomBarMessage("NO HOME SET", 0);
+
+  // distance box
+  drawDistanceFrame();
+  updateDistanceText(0.0f);
+
+  // buttons
+  drawButton(btnSet);
+  drawButton(btnClear);
 }
 
-void stepDistToward(float targetM) {
-  float d = targetM - dispDist;
-  float maxStep = 0.08f;              // meters per frame (~4.8 m/sec at 60fps)
-  d = clampf(d, -maxStep, maxStep);
-  dispDist += d;
+// ---------------- Demo nav (replace later) ----------------
+void computeNavDemo() {
+  // If home isn’t set: distance stays 0 and no arrow
+  if (!homeSet) {
+    targetDistM = 0.0f;
+    return;
+  }
+
+  // Demo: rotate + distance drift
+  targetAngleDeg = wrap360(targetAngleDeg + 6.0f); // spinning
+  targetDistM += 0.12f;                             // getting farther
+  if (targetDistM > 99.9f) targetDistM = 10.0f;
 }
 
-// ---------- Setup / Loop ----------
+// ---------------- Main ----------------
 void setup() {
   Monitor.begin(9600);
 
-  TFT_display.begin();
-  TFT_display.setRotation(1);
-  TFT_display.fillScreen(WHITE);
+  TFT.begin();
+  TFT.setRotation(1);
 
   computeLayout();
+  drawStaticUI();
 
-  // Static background (draw once)
-  drawStatusBar(true, 7, 8.7f);
-  drawBottomBar(0);
-  drawDistanceBoxFrame();
-  drawDistanceValue(dispDist);
-
-  // First arrow draw
-  drawArrowTriangle(dispAngle, MAGENTA);
-  lastDrawAngle = dispAngle;
+  // Start state
+  homeSet = false;
+  targetAngleDeg = 0.0f;
+  targetDistM = 0.0f;
+  shownAngleDeg = 0.0f;
+  shownDistM = 0.0f;
 }
 
 void loop() {
   uint32_t now = millis();
 
-  // ===== DEMO TARGETS (smooth circle + distance increasing) =====
-  // Replace these with real navigation values later.
-  static float targetAngle = 0.0f;
-  static float targetDist  = 41.0f;
+  // --- Touch handling (edge-triggered) ---
+  int tx, ty;
+  bool pressed = readTouchScreen(tx, ty);
 
-  // Make it spin smoothly: ~1.5° per frame target change
-  // (This simulates continuous user movement.)
-  targetAngle = wrap360(targetAngle + 1.5f);
+  // Debug (optional): uncomment to calibrate
+  // if (pressed) { Monitor.print("touch: "); Monitor.print(tx); Monitor.print(","); Monitor.println(ty); }
 
-  // Make distance increase smoothly (getting farther)
-  targetDist += 0.03f;           // ~1.8 m/sec
-  if (targetDist > 51.0f) targetDist = 41.0f;
+  if (pressed && !touchDown && (now - lastTouchMs > 120)) {
+    touchDown = true;
+    lastTouchMs = now;
 
-  // UI update @ ~60fps
+    if (inRect(tx, ty, btnSet)) {
+      flashButton(btnSet);
+      setHomeAction();
+    } else if (inRect(tx, ty, btnClear)) {
+      flashButton(btnClear);
+      clearHomeAction();
+    }
+  }
+  if (!pressed) touchDown = false;
+
+  // --- Nav update (demo for now) ---
+  computeNavDemo();
+
+  // --- UI update ---
   if (now - tUI >= UI_MS) {
     tUI = now;
 
-    // Smoothly step displayed values toward targets
-    stepAngleToward(targetAngle);
-    stepDistToward(targetDist);
+    // Smooth values
+    float alphaAng = 0.22f;
+    float alphaDist = 0.18f;
 
-    // Redraw arrow ONLY if changed enough
-    if (fabsf(angDiff(dispAngle, lastDrawAngle)) > 0.4f) {  // 0.4° threshold
-      eraseArrow(lastDrawAngle);                 // erase old (no rectangle)
-      drawArrowTriangle(dispAngle, MAGENTA);     // draw new
-      lastDrawAngle = dispAngle;
+    float dA = angDiff(targetAngleDeg, shownAngleDeg);
+    shownAngleDeg = wrap360(shownAngleDeg + alphaAng * dA);
+
+    shownDistM += alphaDist * (targetDistM - shownDistM);
+
+    // Arrow: only draw if home set
+    if (homeSet) {
+      updateArrow(shownAngleDeg);
     }
 
-    // Distance smooth (0.1m changes)
-    drawDistanceValue(dispDist);
+    // Distance always shown
+    updateDistanceText(shownDistM);
   }
 
-  // Status/bottom redraw slow
-  if (now - tStatus >= STATUS_MS) {
-    tStatus = now;
+  // --- Bars update slower ---
+  if (now - tBars >= BARS_MS) {
+    tBars = now;
 
-    // Demo values (replace later)
-    static int sats = 7;
+    // Replace with real values later:
+    static int sats = 2;
     sats = (sats % 12) + 1;
     bool gpsLock = (sats > 3);
     float batV = 8.7f;
 
-    // For bottom bar “ERR”, use signed error relative to “forward”
-    // Here we just show a synthetic signed error in [-180..180]
-    float errSigned = wrap180(targetAngle); // demo only
-
     drawStatusBar(gpsLock, sats, batV);
-    drawBottomBar(errSigned);
+
+    if (!homeSet) {
+      drawBottomBarMessage("NO HOME SET", 0);
+    } else {
+      int err = (int)(wrap180(targetAngleDeg) >= 0 ? wrap180(targetAngleDeg) + 0.5f : wrap180(targetAngleDeg) - 0.5f);
+      // You can swap this later for your real bearing-heading error
+      const char* msg = (err > 15) ? "TURN RIGHT" : (err < -15) ? "TURN LEFT" : "STRAIGHT";
+      drawBottomBarMessage(msg, err);
+    }
+
+    // Re-draw buttons (keeps them clean if anything overwrote)
+    drawButton(btnSet);
+    drawButton(btnClear);
   }
 }
