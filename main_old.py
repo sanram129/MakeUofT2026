@@ -18,7 +18,7 @@ def save_gps(gps_str):
         parts = gps_str.split(',')
         
         if len(parts) == 5:
-            # Store EACH data field individually into the JSON
+            # Store EACH data field individually into the JSON!
             data = {
                 "latitude": float(parts[0]),
                 "lat_direction": parts[1].strip(),
@@ -27,6 +27,8 @@ def save_gps(gps_str):
                 "altitude": float(parts[4]),
                 "saved_unix": time.time()
             }
+            
+            # Using indent=4 makes the JSON file nicely formatted and easy to read
             with open(STATE_PATH, "w") as f:
                 json.dump(data, f, indent=4)
             return True
@@ -48,9 +50,9 @@ def load_gps():
         with open(STATE_PATH, "r") as f:
             data = json.load(f)
         
-        # Reconstruct into a clean CSV format for easy C++ parsing
+        # Reconstruct the fields into a pretty string for the Arduino Monitor
         if "latitude" in data:
-            g_str = f"{data['latitude']},{data['lat_direction']},{data['longitude']},{data['lon_direction']},{data['altitude']}"
+            g_str = f"{data['latitude']}{data['lat_direction']}, {data['longitude']}{data['lon_direction']}, {data['altitude']}m"
         else:
             g_str = "No Data"
         
@@ -59,6 +61,7 @@ def load_gps():
         gps_string_list.append('\0') # Add null terminator for C++
         
         char_index = 0 # Reset the pointer
+        print(f"Loaded GPS payload: {g_str}")
         return g_str
         
     except Exception as e:
@@ -68,20 +71,22 @@ def load_gps():
 
 def send_gps_char():
     global char_index, gps_string_list
+    # SAFETY CHECK: Only try to access the list if 'char_index' is within bounds
     if char_index < len(gps_string_list):
         char = gps_string_list[char_index]
         char_index += 1
         return char
-    return '\0'
+    return '\0' # Return null if the Arduino asks for more than we have
 
 def verify_gps():
+    # A quick function to return the full formatted string immediately after a save
     try:
         if not os.path.exists(STATE_PATH):
             return "No Data"
         with open(STATE_PATH, "r") as f:
             data = json.load(f)
         if "latitude" in data:
-            return f"{data['latitude']}{data['lat_direction']}, {data['longitude']}{data['lon_direction']}"
+            return f"{data['latitude']}{data['lat_direction']}, {data['longitude']}{data['lon_direction']}, {data['altitude']}m"
         return "No Data"
     except:
         return "error"
@@ -90,7 +95,7 @@ def reset_iteration():
     global char_index
     char_index = 0
 
-# Register RPC calls
+# Registering methods with the exact names the Arduino C++ code expects
 Bridge.provide("linux_started", linux_started)
 Bridge.provide("save_gps", save_gps)
 Bridge.provide("load_gps", load_gps)
