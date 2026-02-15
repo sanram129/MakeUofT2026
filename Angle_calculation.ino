@@ -38,33 +38,25 @@ float targetAlt = 0.0f;
 bool  hasTarget = false;
 
 // ---------- Tunables ----------
-static const uint32_t MAG_CAL_MS = 8000;         // rotate device for ~8s on boot
-static const float    DIST_ALPHA = 0.20f;        // distance smoothing 0.1..0.3
-static const float    COURSE_MIN_MOVE_M = 2.5f;  // must move this much to trust course heading
-static const uint32_t COURSE_VALID_MS = 8000;    // course heading stays valid this long after last update
+static const float DIST_ALPHA = 0.20f; // distance smoothing 0.1..0.3
 
-// If your headings are consistently off, tweak these:
-static const float MAG_DECLINATION_DEG = 0.0f;   // set to local declination if desired
-static const float MAG_HEADING_OFFSET_DEG = 0.0f;
+// If your compass headings are consistently off, set these:
+static const float MAG_DECLINATION_DEG = 0.0f;   // (magnetic->true north). Look up for your area.
+static const float MAG_HEADING_OFFSET_DEG = 0.0f; // manual tweak after testing
 
-// If axis seems rotated or mirrored, flip these (0/1)
+// If compass seems rotated/mirrored, change these (0/1) until it matches reality.
 #define MAG_SWAP_XY   0
 #define MAG_INVERT_X  0
 #define MAG_INVERT_Y  0
 
 // ---------- TIMEZONE ----------
-// GNSS time is UTC. Set offset minutes if you want local time.
-// Examples:
-//  UTC   = 0
-//  UTC-5 = -300
-//  UTC-4 = -240
 static const int TIMEZONE_OFFSET_MIN = 0;
 
 // ================= LAYOUT (INFO PANEL + ARROW AREA) =================
 static const int INFO_X = MARGIN;
 static const int INFO_Y = STATUS_H + MARGIN;
 static const int INFO_W = 260;
-static const int INFO_H = 170;
+static const int INFO_H = 188; // a bit taller to fit REL line
 
 // Arrow area lives to the right of the info panel
 int ARROW_X=0, ARROW_Y=0, ARROW_W=0, ARROW_H=0;
@@ -83,12 +75,6 @@ static float wrap180(float x) {
   return x;
 }
 
-// circular smoothing for angles
-static float smoothAngle(float prev, float now, float alpha) {
-  float d = wrap180(now - prev);
-  return wrap360(prev + alpha * d);
-}
-
 // ---- Date helpers (for timezone adjustment + ticking) ----
 static bool isLeapYear(int y) { return (y%400==0) || (y%4==0 && y%100!=0); }
 static int daysInMonth(int y, int m) {
@@ -96,14 +82,12 @@ static int daysInMonth(int y, int m) {
   if (m == 2) return d[m-1] + (isLeapYear(y) ? 1 : 0);
   return d[m-1];
 }
-
 static void incOneDay(int &yy, int &mm, int &dd) {
   dd++;
   int dim = daysInMonth(yy, mm);
   if (dd > dim) { dd = 1; mm++; }
   if (mm > 12) { mm = 1; yy++; }
 }
-
 static void decOneDay(int &yy, int &mm, int &dd) {
   dd--;
   if (dd < 1) {
@@ -112,7 +96,6 @@ static void decOneDay(int &yy, int &mm, int &dd) {
     dd = daysInMonth(yy, mm);
   }
 }
-
 static void addMinutesToDateTime(int &yy, int &mm, int &dd, int &hh, int &mi, int deltaMin) {
   int total = hh * 60 + mi + deltaMin;
   while (total < 0) { total += 1440; decOneDay(yy, mm, dd); }
@@ -179,57 +162,11 @@ float calculateBearing(float currLat, float currLon, float destLat, float destLo
   float x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon);
 
   float bearing = atan2(y, x) * 180.0f / PI;
-  if (bearing < 0) bearing += 360.0f;
-  return bearing;
+  return wrap360(bearing);
 }
 
-// ---------- Magnetometer calibration + corrected heading ----------
-float magOffX = 0, magOffY = 0;
-float magScaleX = 1, magScaleY = 1;
-
-void calibrateMag2D(uint32_t ms = 8000) {
-  float minX =  1e9f, maxX = -1e9f;
-  float minY =  1e9f, maxY = -1e9f;
-
-  uint32_t t0 = millis();
-  sensors_event_t e;
-
-  while (millis() - t0 < ms) {
-    mag.getEvent(&e);
-
-    float x = e.magnetic.x;
-    float y = e.magnetic.y;
-
-#if MAG_SWAP_XY
-    float tmp = x; x = y; y = tmp;
-#endif
-#if MAG_INVERT_X
-    x = -x;
-#endif
-#if MAG_INVERT_Y
-    y = -y;
-#endif
-
-    if (x < minX) minX = x;
-    if (x > maxX) maxX = x;
-    if (y < minY) minY = y;
-    if (y > maxY) maxY = y;
-
-    delay(40);
-  }
-
-  magOffX = (maxX + minX) * 0.5f;
-  magOffY = (maxY + minY) * 0.5f;
-
-  float rx = (maxX - minX) * 0.5f;
-  float ry = (maxY - minY) * 0.5f;
-  float avg = (rx + ry) * 0.5f;
-
-  magScaleX = (rx > 1e-6f) ? (avg / rx) : 1.0f;
-  magScaleY = (ry > 1e-6f) ? (avg / ry) : 1.0f;
-}
-
-// corrected CW-from-North magnetic heading
+// ---------- Compass heading (NO calibration) ----------
+// Returns heading CW-from-North in degrees (0=N, 90=E...)
 float getMagHeadingCW() {
   sensors_event_t e;
   mag.getEvent(&e);
@@ -247,58 +184,16 @@ float getMagHeadingCW() {
   y = -y;
 #endif
 
-  float mx = (x - magOffX) * magScaleX;
-  float my = (y - magOffY) * magScaleY;
+  // raw is CCW from +X axis
+  float raw = atan2f(y, x) * 180.0f / PI;
 
-  float raw = atan2(my, mx) * 180.0f / PI;     // CCW from +X
-  float heading = wrap360(90.0f - raw);        // CW-from-N
+  // convert to CW-from-North
+  float heading = wrap360(90.0f - raw);
+
+  // convert magnetic->true and allow manual tweak
   heading = wrap360(heading + MAG_DECLINATION_DEG + MAG_HEADING_OFFSET_DEG);
+
   return heading;
-}
-
-// ---------- GPS course heading ----------
-bool  havePrevFix = false;
-float prevFixLat = 0, prevFixLon = 0;
-uint32_t prevFixMs = 0;
-
-bool  haveCourse = false;
-float courseHeading = 0;
-uint32_t lastCourseMs = 0;
-
-// update course heading if we've moved enough
-void updateCourseHeading(float currLat, float currLon) {
-  uint32_t now = millis();
-
-  if (!havePrevFix) {
-    havePrevFix = true;
-    prevFixLat = currLat;
-    prevFixLon = currLon;
-    prevFixMs  = now;
-    haveCourse = false;
-    return;
-  }
-
-  float stepDist = calculateDistance(prevFixLat, prevFixLon, currLat, currLon);
-
-  if (stepDist >= COURSE_MIN_MOVE_M) {
-    float newCourse = calculateBearing(prevFixLat, prevFixLon, currLat, currLon);
-
-    if (!haveCourse) {
-      courseHeading = newCourse;
-      haveCourse = true;
-    } else {
-      courseHeading = smoothAngle(courseHeading, newCourse, 0.35f);
-    }
-    lastCourseMs = now;
-
-    prevFixLat = currLat;
-    prevFixLon = currLon;
-    prevFixMs  = now;
-  }
-
-  if (haveCourse && (now - lastCourseMs > COURSE_VALID_MS)) {
-    haveCourse = false;
-  }
 }
 
 // ---------- Linux HOME retrieval ----------
@@ -411,7 +306,6 @@ void updateBottomLeftDistance(float distM) {
   }
 }
 
-// generic right-side text writer (so we can show placeholders until GNSS sync)
 void updateBottomRightText(const char *buf) {
   int W = TFT.width();
   int H = TFT.height();
@@ -510,12 +404,10 @@ struct SoftClock {
   }
 } clockSim;
 
-// Try syncing from GNSS UTC+Date; returns true if updated
 static bool syncClockFromGNSS() {
   DFRobot_GNSSAndRTC::sTim_t utc  = gnss.getUTC();
   DFRobot_GNSSAndRTC::sTim_t date = gnss.getDate();
 
-  // sanity check
   if (date.year < 2000 || date.year > 2099) return false;
   if (date.month < 1 || date.month > 12) return false;
   if (date.date < 1 || date.date > 31) return false;
@@ -528,7 +420,6 @@ static bool syncClockFromGNSS() {
   int mi = (int)utc.minute;
   int ss = (int)utc.second;
 
-  // apply timezone offset if desired
   if (TIMEZONE_OFFSET_MIN != 0) {
     addMinutesToDateTime(yy, mm, dd, hh, mi, TIMEZONE_OFFSET_MIN);
   }
@@ -544,14 +435,14 @@ static void drawInfoPanelFrame() {
 }
 
 static void updateInfoPanel(float currLat, float currLon, float altM,
-                            float headingUsedDeg, const String &dirUsed, char headingSrc,
+                            float headingDeg, const String &headingDir,
                             bool haveHome,
-                            float homeLat, float homeLon, float homeAlt,
+                            float homeLat, float homeLon,
                             bool haveTargetData,
-                            float angleToTarget, const String &targetDir,
+                            float bearingDeg, const String &bearingDir,
+                            float relDegSigned,
                             const String &distanceStr) {
 
-  // Clear ENTIRE panel and redraw border to avoid overlay artifacts
   TFT.fillRect(INFO_X, INFO_Y, INFO_W, INFO_H, WHITE);
   TFT.drawRect(INFO_X, INFO_Y, INFO_W, INFO_H, BLACK);
 
@@ -574,20 +465,23 @@ static void updateInfoPanel(float currLat, float currLon, float altM,
   }
 
   TFT.setCursor(x, cy);
-  TFT.print("HDG: "); TFT.print(headingUsedDeg, 1); TFT.print(" ");
-  TFT.print(dirUsed); TFT.print(" ");
-  TFT.print(headingSrc);
+  TFT.print("HDG: "); TFT.print(headingDeg, 1); TFT.print(" "); TFT.print(headingDir);
   cy += 18;
 
   if (haveTargetData) {
     TFT.setCursor(x, cy);
-    TFT.print("BRG: "); TFT.print(angleToTarget, 1); TFT.print(" "); TFT.print(targetDir);
+    TFT.print("BRG: "); TFT.print(bearingDeg, 1); TFT.print(" "); TFT.print(bearingDir);
+    cy += 18;
+
+    TFT.setCursor(x, cy);
+    TFT.print("REL: "); TFT.print(relDegSigned, 1); // + right turn, - left turn (by our definition)
     cy += 18;
 
     TFT.setCursor(x, cy);
     TFT.print("DST: "); TFT.print(distanceStr);
   } else {
     TFT.setCursor(x, cy); TFT.print("BRG: --"); cy += 18;
+    TFT.setCursor(x, cy); TFT.print("REL: --"); cy += 18;
     TFT.setCursor(x, cy); TFT.print("DST: --");
   }
 }
@@ -638,36 +532,27 @@ void setup() {
   updateBottomLeftDistance(-1.0f);
   updateBottomRightText("--:--:--  ---- -- --");
 
-  // Clear arrow area + center dot
   TFT.fillRect(ARROW_X, ARROW_Y, ARROW_W, ARROW_H, WHITE);
   TFT.fillCircle(ARROW_CX, ARROW_CY, 3, BLACK);
 
-  // Load HOME if exists
   retrieveTargetFromLinux();
-
-  // One-time calibration on boot
-  TFT.setTextSize(2);
-  TFT.setTextColor(BLACK, WHITE);
-  TFT.setCursor(MARGIN, STATUS_H + MARGIN + 160);
-  TFT.print("Calibrating MAG... rotate");
-  calibrateMag2D(MAG_CAL_MS);
-  TFT.fillRect(MARGIN, STATUS_H + MARGIN + 160, 320, 18, WHITE);
 }
 
 void loop() {
   Bridge.update();
 
-  static float arrowAngleScreen = 0.0f; // 0=right, 90=down
+  static float arrowAngleScreen = 270.0f; // start pointing up
   static bool haveNav = false;
 
   static float currLat = 0.0f, currLon = 0.0f, altM = 0.0f;
 
-  static float headingUsed = 0.0f;   // CW-from-N
-  static char  headingSrc = 'M';     // 'M' mag or 'G' gps course
-  static String dirUsed = "?";
+  static float headingDeg = 0.0f; // CW-from-N
+  static String headingDir = "?";
 
-  static float angleToTarget = 0.0f; // CW-from-N
-  static String targetDirStr = "?";
+  static float bearingDeg = 0.0f; // CW-from-N
+  static String bearingDir = "?";
+
+  static float relDegSigned = 0.0f; // signed [-180,180]
   static float distanceRaw = -1.0f;
   static String distanceStr = "--";
 
@@ -693,7 +578,7 @@ void loop() {
       RpcCall c = Bridge.call("save_gps", gpsStr);
       c.result(ok);
 
-      retrieveTargetFromLinux(); // update screen right away
+      retrieveTargetFromLinux();
     }
     delay(200);
   }
@@ -708,12 +593,11 @@ void loop() {
     updateStatusBar(gpsLock, (int)satellites, 8.7f);
   }
 
-  // ---- Clock update (ticks locally; GNSS sync happens below) ----
+  // ---- Clock update ----
   static uint32_t lastBottom = 0;
   if (millis() - lastBottom > 250) {
     lastBottom = millis();
     clockSim.tick();
-
     if (clockSim.valid) {
       updateBottomRightDateTime(clockSim.yy, clockSim.mm, clockSim.dd,
                                 clockSim.hh, clockSim.mi, clockSim.ss);
@@ -722,100 +606,87 @@ void loop() {
     }
   }
 
-  // ---- NAV update (every 2 seconds) ----
+  // ---- NAV update (every 500 ms) ----
   static uint32_t lastNav = 0;
-  if (millis() - lastNav > 2000) {
+  if (millis() - lastNav > 500) {
     lastNav = millis();
 
-    // Current GPS
+    // read GPS
     DFRobot_GNSSAndRTC::sLonLat_t lat = gnss.getLat();
     DFRobot_GNSSAndRTC::sLonLat_t lon = gnss.getLon();
     altM = (float)gnss.getAlt();
     satellites = gnss.getNumSatUsed();
     gpsLock = (satellites > 0);
 
-    currLat = lat.latitudeDegree;
-    if (lat.latDirection == 'S') currLat = -currLat;
+    float currLatTmp = lat.latitudeDegree;
+    if (lat.latDirection == 'S') currLatTmp = -currLatTmp;
 
-    currLon = lon.lonitudeDegree;
-    if (lon.lonDirection == 'W') currLon = -currLon;
+    float currLonTmp = lon.lonitudeDegree;
+    if (lon.lonDirection == 'W') currLonTmp = -currLonTmp;
 
-    // ✅ Sync time from GNSS when we have lock
-    if (gpsLock) {
-      syncClockFromGNSS();
-    }
+    currLat = currLatTmp;
+    currLon = currLonTmp;
 
-    // Update course heading from GPS motion (if moved enough)
-    if (gpsLock) {
-      updateCourseHeading(currLat, currLon);
-    } else {
-      haveCourse = false;
-    }
+    if (gpsLock) syncClockFromGNSS();
 
-    // Magnetometer heading (corrected)
-    float headingMag = getMagHeadingCW();
+    // read compass heading (device must be flat!)
+    headingDeg = getMagHeadingCW();
+    headingDir = getCardinalDirection(headingDeg);
 
-    // Choose heading source
-    if (haveCourse) {
-      headingUsed = courseHeading;
-      headingSrc = 'G';
-    } else {
-      headingUsed = headingMag;
-      headingSrc = 'M';
-    }
-    dirUsed = getCardinalDirection(headingUsed);
-
-    // Load HOME from JSON
+    // load HOME
     retrieveTargetFromLinux();
 
     if (gpsLock && hasTarget) {
-      angleToTarget = calculateBearing(currLat, currLon, targetLat, targetLon);
-      targetDirStr = getCardinalDirection(angleToTarget);
+      bearingDeg = calculateBearing(currLat, currLon, targetLat, targetLon);
+      bearingDir = getCardinalDirection(bearingDeg);
+
+      // the key line: RELATIVE turn direction
+      // + means HOME is to the RIGHT, - means to the LEFT (by this convention)
+      relDegSigned = wrap180(bearingDeg - headingDeg);
 
       distanceRaw = calculateDistance(currLat, currLon, targetLat, targetLon);
 
-      // distance smoothing
       if (distFilt < 0) distFilt = distanceRaw;
       distFilt = distFilt + DIST_ALPHA * (distanceRaw - distFilt);
 
       float distShow = distFilt;
 
-      if (distShow >= 1000.0f) {
-        distanceStr = String(distShow / 1000.0f, 2) + " km";
-      } else {
-        distanceStr = String(distShow, 0) + " m";
-      }
+      if (distShow >= 1000.0f) distanceStr = String(distShow / 1000.0f, 2) + " km";
+      else                      distanceStr = String(distShow, 0) + " m";
 
       haveNav = true;
       updateBottomLeftDistance(distShow);
 
-      // Arrow: bearing CW-from-N -> screen angle (0=right, 90=down)
-      // N(0) should point UP => screen 270
-      arrowAngleScreen = wrap360(angleToTarget + 270.0f);
+      // draw arrow using RELATIVE direction:
+      // rel=0 means "ahead" -> should point UP (270 in your screen angle system)
+      float rel360 = wrap360(relDegSigned);
+      arrowAngleScreen = wrap360(rel360 + 270.0f);
 
     } else {
       haveNav = false;
-      distanceRaw = -1.0f;
       distFilt = -1.0f;
       distanceStr = "--";
       updateBottomLeftDistance(-1.0f);
     }
 
     updateInfoPanel(currLat, currLon, altM,
-                    headingUsed, dirUsed, headingSrc,
-                    hasTarget, targetLat, targetLon, targetAlt,
-                    haveNav, angleToTarget, targetDirStr,
+                    headingDeg, headingDir,
+                    hasTarget, targetLat, targetLon,
+                    haveNav, bearingDeg, bearingDir,
+                    relDegSigned,
                     distanceStr);
   }
 
-  // ---- Arrow draw (clean: redraw only inside arrow area) ----
+  // ---- Arrow draw ----
   TFT.fillRect(ARROW_X, ARROW_Y, ARROW_W, ARROW_H, WHITE);
   TFT.fillCircle(ARROW_CX, ARROW_CY, 3, BLACK);
-  drawArrowAt(ARROW_CX, ARROW_CY, arrowAngleScreen, MAGENTA);
 
-  // If no nav yet, keep arrow alive
-  if (!haveNav) {
-    arrowAngleScreen = wrap360(arrowAngleScreen + 3.0f);
+  if (haveNav) {
+    drawArrowAt(ARROW_CX, ARROW_CY, arrowAngleScreen, MAGENTA);
+  } else {
+    // optional idle animation
+    arrowAngleScreen = wrap360(arrowAngleScreen + 2.0f);
+    drawArrowAt(ARROW_CX, ARROW_CY, arrowAngleScreen, MAGENTA);
   }
 
   delay(25);
