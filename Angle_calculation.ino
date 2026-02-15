@@ -25,7 +25,7 @@ static const int MARGIN   = 8;
 
 float prevAngle = NAN;
 
-// ================= BACKEND (moved into UI sketch) =================
+// ================= BACKEND =================
 #define I2C_COMMUNICATION
 DFRobot_GNSSAndRTC_I2C gnss(&Wire, MODULE_I2C_ADDRESS);
 Adafruit_LIS2MDL mag = Adafruit_LIS2MDL(12345);
@@ -33,18 +33,47 @@ Adafruit_LIS2MDL mag = Adafruit_LIS2MDL(12345);
 const int buttonPin = A5;
 int lastButtonState = HIGH;
 
-// Saved HOME ("target") values loaded from JSON
+// HOME saved in Linux JSON (loaded via Bridge)
 float targetLat = 0.0f;
 float targetLon = 0.0f;
-float targetAlt = 0.0f;   // ✅ NEW: store altitude too
-bool hasTarget = false;
+float targetAlt = 0.0f;
+bool  hasTarget = false;
 
+// ---------- Tunables ----------
+static const uint32_t MAG_CAL_MS = 8000;     // rotate device for ~8s on boot
+static const float    DIST_ALPHA = 0.20f;    // distance smoothing 0.1..0.3
+static const float    COURSE_MIN_MOVE_M = 2.5f; // must move this much to trust course heading
+static const uint32_t COURSE_VALID_MS = 8000;   // course heading stays valid this long after last update
+
+// If your headings are consistently off, tweak these:
+static const float MAG_DECLINATION_DEG = 0.0f;  // set to local declination if desired
+static const float MAG_HEADING_OFFSET_DEG = 0.0f;
+
+// If axis seems rotated or mirrored, flip these (0/1)
+#define MAG_SWAP_XY   0
+#define MAG_INVERT_X  0
+#define MAG_INVERT_Y  0
+
+// ---------- Helpers ----------
 static float wrap360(float x) {
-  while (x < 0.0f)   x += 360.0f;
+  while (x < 0.0f)    x += 360.0f;
   while (x >= 360.0f) x -= 360.0f;
   return x;
 }
 
+static float wrap180(float x) {
+  while (x < -180.0f) x += 360.0f;
+  while (x > 180.0f)  x -= 360.0f;
+  return x;
+}
+
+// circular smoothing for angles
+static float smoothAngle(float prev, float now, float alpha) {
+  float d = wrap180(now - prev);
+  return wrap360(prev + alpha * d);
+}
+
+// ---------- Bridge wait ----------
 static bool waitForPython(uint32_t timeoutMs = 10000) {
   bool started = false;
   uint32_t t0 = millis();
@@ -57,20 +86,21 @@ static bool waitForPython(uint32_t timeoutMs = 10000) {
   return started;
 }
 
-// Convert 360 Degree Angle to Cardinal String (same as your backend)
+// ✅ FIXED: Standard CW-from-North mapping (0=N, 90=E, 180=S, 270=W)
 String getCardinalDirection(float heading) {
-  if (heading >= 337.5 || heading < 22.5)  return "N";
-  if (heading >= 22.5  && heading < 67.5)  return "NW";
-  if (heading >= 67.5  && heading < 112.5) return "W";
-  if (heading >= 112.5 && heading < 157.5) return "SW";
-  if (heading >= 157.5 && heading < 202.5) return "S";
-  if (heading >= 202.5 && heading < 247.5) return "SE";
-  if (heading >= 247.5 && heading < 292.5) return "E";
-  if (heading >= 292.5 && heading < 337.5) return "NE";
+  heading = wrap360(heading);
+  if (heading >= 337.5f || heading < 22.5f)  return "N";
+  if (heading < 67.5f)   return "NE";
+  if (heading < 112.5f)  return "E";
+  if (heading < 157.5f)  return "SE";
+  if (heading < 202.5f)  return "S";
+  if (heading < 247.5f)  return "SW";
+  if (heading < 292.5f)  return "W";
+  if (heading < 337.5f)  return "NW";
   return "?";
 }
 
-// Distance in meters (Haversine)
+// Haversine distance
 float calculateDistance(float currLat, float currLon, float destLat, float destLon) {
   float R = 6371000.0f;
   float lat1 = currLat * PI / 180.0f;
@@ -89,7 +119,7 @@ float calculateDistance(float currLat, float currLon, float destLat, float destL
   return R * c;
 }
 
-// Bearing
+// Bearing CW-from-North
 float calculateBearing(float currLat, float currLon, float destLat, float destLon) {
   float lat1 = currLat * PI / 180.0f;
   float lon1 = currLon * PI / 180.0f;
@@ -105,8 +135,133 @@ float calculateBearing(float currLat, float currLon, float destLat, float destLo
   return bearing;
 }
 
-// Retrieve HOME ("target") from Linux JSON, char-by-char
-// ✅ NEW: also parses altitude after idx4
+// ---------- Magnetometer calibration + corrected heading ----------
+float magOffX = 0, magOffY = 0;
+float magScaleX = 1, magScaleY = 1;
+
+void calibrateMag2D(uint32_t ms = 8000) {
+  float minX =  1e9f, maxX = -1e9f;
+  float minY =  1e9f, maxY = -1e9f;
+
+  uint32_t t0 = millis();
+  sensors_event_t e;
+
+  while (millis() - t0 < ms) {
+    mag.getEvent(&e);
+
+    float x = e.magnetic.x;
+    float y = e.magnetic.y;
+
+#if MAG_SWAP_XY
+    float tmp = x; x = y; y = tmp;
+#endif
+#if MAG_INVERT_X
+    x = -x;
+#endif
+#if MAG_INVERT_Y
+    y = -y;
+#endif
+
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+
+    delay(40);
+  }
+
+  magOffX = (maxX + minX) * 0.5f;
+  magOffY = (maxY + minY) * 0.5f;
+
+  float rx = (maxX - minX) * 0.5f;
+  float ry = (maxY - minY) * 0.5f;
+  float avg = (rx + ry) * 0.5f;
+
+  magScaleX = (rx > 1e-6f) ? (avg / rx) : 1.0f;
+  magScaleY = (ry > 1e-6f) ? (avg / ry) : 1.0f;
+}
+
+// corrected CW-from-North magnetic heading
+float getMagHeadingCW() {
+  sensors_event_t e;
+  mag.getEvent(&e);
+
+  float x = e.magnetic.x;
+  float y = e.magnetic.y;
+
+#if MAG_SWAP_XY
+  float tmp = x; x = y; y = tmp;
+#endif
+#if MAG_INVERT_X
+  x = -x;
+#endif
+#if MAG_INVERT_Y
+  y = -y;
+#endif
+
+  // hard/soft-iron correction
+  float mx = (x - magOffX) * magScaleX;
+  float my = (y - magOffY) * magScaleY;
+
+  // raw angle CCW from +X
+  float raw = atan2(my, mx) * 180.0f / PI;
+
+  // convert to CW-from-North
+  float heading = wrap360(90.0f - raw);
+
+  heading = wrap360(heading + MAG_DECLINATION_DEG + MAG_HEADING_OFFSET_DEG);
+  return heading;
+}
+
+// ---------- GPS course heading ----------
+bool  havePrevFix = false;
+float prevFixLat = 0, prevFixLon = 0;
+uint32_t prevFixMs = 0;
+
+bool  haveCourse = false;
+float courseHeading = 0;
+uint32_t lastCourseMs = 0;
+
+// update course heading if we've moved enough
+void updateCourseHeading(float currLat, float currLon) {
+  uint32_t now = millis();
+
+  if (!havePrevFix) {
+    havePrevFix = true;
+    prevFixLat = currLat;
+    prevFixLon = currLon;
+    prevFixMs  = now;
+    haveCourse = false;
+    return;
+  }
+
+  float stepDist = calculateDistance(prevFixLat, prevFixLon, currLat, currLon);
+
+  // only accept course if we actually moved (filters jitter)
+  if (stepDist >= COURSE_MIN_MOVE_M) {
+    float newCourse = calculateBearing(prevFixLat, prevFixLon, currLat, currLon);
+
+    if (!haveCourse) {
+      courseHeading = newCourse;
+      haveCourse = true;
+    } else {
+      courseHeading = smoothAngle(courseHeading, newCourse, 0.35f);
+    }
+    lastCourseMs = now;
+
+    // update baseline ONLY when moved enough
+    prevFixLat = currLat;
+    prevFixLon = currLon;
+    prevFixMs  = now;
+  }
+
+  // expire if old
+  if (haveCourse && (now - lastCourseMs > COURSE_VALID_MS)) {
+    haveCourse = false;
+  }
+}
+
+// ---------- Linux HOME retrieval ----------
 void retrieveTargetFromLinux() {
   String recoveredGPS = "";
   Bridge.call("load_gps");
@@ -141,7 +296,6 @@ void retrieveTargetFromLinux() {
       String lonDir = recoveredGPS.substring(idx3 + 1, idx4);
 
       float tAlt = 0.0f;
-      // altitude is after idx4
       if (idx4 + 1 < (int)recoveredGPS.length()) {
         tAlt = recoveredGPS.substring(idx4 + 1).toFloat();
       }
@@ -169,7 +323,6 @@ void drawStatusBarFrame() {
 
 void updateStatusBar(bool gpsLock, int sats, float batteryV) {
   int W = TFT.width();
-
   TFT.setTextSize(2);
 
   TFT.setCursor(MARGIN, 6);
@@ -199,12 +352,10 @@ void drawBottomBarFrame() {
   TFT.drawLine(0, y0, W, y0, BLACK);
 }
 
-// UNO-safe distance print (no snprintf float)
 void updateBottomLeftDistance(float distM) {
   int H = TFT.height();
   int y0 = H - BOTTOM_H;
 
-  // clear left side area so it overwrites cleanly
   TFT.fillRect(0, y0 + 1, 200, BOTTOM_H - 2, GRAY);
 
   TFT.setTextSize(2);
@@ -238,7 +389,6 @@ void updateBottomRightDateTime(int yy, int mm, int dd, int hh, int mi, int ss) {
   int x = W - MARGIN - textW;
   if (x < 0) x = 0;
 
-  // clear right side area
   TFT.fillRect(x - 4, y0 + 1, textW + 10, BOTTOM_H - 2, GRAY);
 
   TFT.setCursor(x, y0 + 10);
@@ -324,17 +474,17 @@ struct SoftClock {
   }
 } clockSim;
 
-// ================= Info Panel (shows CURRENT + HOME) =================
+// ================= Info Panel =================
 static void drawInfoPanelFrame() {
   int x = MARGIN;
   int y = STATUS_H + MARGIN;
-  int w = 260;
-  int h = 170;
+  int w = 240;
+  int h = 150; // enough for home lines too
   TFT.drawRect(x, y, w, h, BLACK);
 }
 
 static void updateInfoPanel(float currLat, float currLon, float altM,
-                            float headingDeg, const String &currDir,
+                            float headingUsedDeg, const String &dirUsed, char headingSrc,
                             bool haveHome,
                             float homeLat, float homeLon, float homeAlt,
                             bool haveTargetData,
@@ -342,8 +492,8 @@ static void updateInfoPanel(float currLat, float currLon, float altM,
                             const String &distanceStr) {
   int x = MARGIN + 1;
   int y = STATUS_H + MARGIN + 1;
-  int w = 260 - 2;
-  int h = 170 - 2;
+  int w = 240 - 2;
+  int h = 150 - 2;
 
   TFT.fillRect(x, y, w, h, WHITE);
   TFT.setTextSize(2);
@@ -351,37 +501,28 @@ static void updateInfoPanel(float currLat, float currLon, float altM,
 
   int cy = y + 4;
 
-  // CURRENT
-  TFT.setCursor(x + 6, cy); TFT.print("CUR LAT: "); TFT.print(currLat, 6);
-  cy += 18;
-  TFT.setCursor(x + 6, cy); TFT.print("CUR LON: "); TFT.print(currLon, 6);
-  cy += 18;
-  TFT.setCursor(x + 6, cy); TFT.print("CUR ALT: "); TFT.print(altM, 1); TFT.print("m");
-  cy += 18;
+  // current
+  TFT.setCursor(x + 6, cy); TFT.print("LAT: "); TFT.print(currLat, 6); cy += 18;
+  TFT.setCursor(x + 6, cy); TFT.print("LON: "); TFT.print(currLon, 6); cy += 18;
+  TFT.setCursor(x + 6, cy); TFT.print("ALT: "); TFT.print(altM, 1); TFT.print("m"); cy += 18;
 
-  // HOME (saved)
+  // home
   if (haveHome) {
-    TFT.setCursor(x + 6, cy); TFT.print("HOME LAT: "); TFT.print(homeLat, 6);
-    cy += 18;
-    TFT.setCursor(x + 6, cy); TFT.print("HOME LON: "); TFT.print(homeLon, 6);
-    cy += 18;
-    TFT.setCursor(x + 6, cy); TFT.print("HOME ALT: "); TFT.print(homeAlt, 1); TFT.print("m");
-    cy += 18;
+    TFT.setCursor(x + 6, cy); TFT.print("HLA: "); TFT.print(homeLat, 6); cy += 18;
+    TFT.setCursor(x + 6, cy); TFT.print("HLN: "); TFT.print(homeLon, 6); cy += 18;
   } else {
-    TFT.setCursor(x + 6, cy); TFT.print("HOME: --");
-    cy += 18;
-    TFT.setCursor(x + 6, cy); TFT.print(" ");
-    cy += 18;
-    TFT.setCursor(x + 6, cy); TFT.print(" ");
-    cy += 18;
+    TFT.setCursor(x + 6, cy); TFT.print("HLA: --"); cy += 18;
+    TFT.setCursor(x + 6, cy); TFT.print("HLN: --"); cy += 18;
   }
 
-  // HEADING
+  // heading
   TFT.setCursor(x + 6, cy);
-  TFT.print("HDG: "); TFT.print(headingDeg, 1); TFT.print(" "); TFT.print(currDir);
+  TFT.print("HDG: "); TFT.print(headingUsedDeg, 1); TFT.print(" ");
+  TFT.print(dirUsed); TFT.print(" ");
+  TFT.print(headingSrc); // 'G' or 'M'
   cy += 18;
 
-  // TARGET + DIST
+  // bearing + distance
   if (haveTargetData) {
     TFT.setCursor(x + 6, cy);
     TFT.print("BRG: "); TFT.print(angleToTarget, 1); TFT.print(" "); TFT.print(targetDir);
@@ -390,13 +531,14 @@ static void updateInfoPanel(float currLat, float currLon, float altM,
     TFT.setCursor(x + 6, cy);
     TFT.print("DST: "); TFT.print(distanceStr);
   } else {
-    TFT.setCursor(x + 6, cy); TFT.print("BRG: --");
-    cy += 18;
+    TFT.setCursor(x + 6, cy); TFT.print("BRG: --"); cy += 18;
     TFT.setCursor(x + 6, cy); TFT.print("DST: --");
   }
 }
 
 // ================= Setup / Loop =================
+float distFilt = -1.0f;
+
 void setup() {
   Monitor.begin(9600);
 
@@ -433,31 +575,40 @@ void setup() {
   int cy = (STATUS_H + (TFT.height() - BOTTOM_H)) / 2;
   TFT.fillCircle(cx, cy, 3, BLACK);
 
-  // Load HOME once at boot so it shows if already saved
+  // Load HOME if exists
   retrieveTargetFromLinux();
+
+  // Do a one-time calibration on boot
+  TFT.setTextSize(2);
+  TFT.setTextColor(BLACK, WHITE);
+  TFT.setCursor(MARGIN, STATUS_H + MARGIN + 160);
+  TFT.print("Calibrating MAG... rotate");
+  calibrateMag2D(MAG_CAL_MS);
+  TFT.fillRect(MARGIN, STATUS_H + MARGIN + 160, 320, 18, WHITE);
 }
 
 void loop() {
   Bridge.update();
 
-  static float angle = 0.0f;       // screen angle used by drawArrow()
+  static float arrowAngleScreen = 0.0f; // 0=right, 90=down
   static bool haveNav = false;
 
   static float currLat = 0.0f, currLon = 0.0f, altM = 0.0f;
-  static float currentHeading = 0.0f;
-  static String currentDirStr = "?";
 
-  static float angleToTarget = 0.0f;
+  static float headingUsed = 0.0f;   // CW-from-N
+  static char  headingSrc = 'M';     // 'M' mag or 'G' gps course
+  static String dirUsed = "?";
+
+  static float angleToTarget = 0.0f; // CW-from-N
   static String targetDirStr = "?";
-  static float distanceInMeters = -1.0f;
+  static float distanceRaw = -1.0f;
   static String distanceStr = "--";
 
   static uint8_t satellites = 0;
   static bool gpsLock = false;
 
-  // ---- Button press logic: Save HOME (lat/lon/alt) to JSON ----
+  // ---- Button press: Save HOME to JSON ----
   int currentButtonState = digitalRead(buttonPin);
-
   if (lastButtonState == HIGH && currentButtonState == LOW) {
     satellites = gnss.getNumSatUsed();
     if (satellites > 0) {
@@ -475,14 +626,13 @@ void loop() {
       RpcCall c = Bridge.call("save_gps", gpsStr);
       c.result(ok);
 
-      // ✅ Immediately reload HOME so screen updates right away
-      retrieveTargetFromLinux();
+      retrieveTargetFromLinux(); // update screen right away
     }
     delay(200);
   }
   lastButtonState = currentButtonState;
 
-  // ---- Status update (real satellites) ----
+  // ---- Status update ----
   static uint32_t lastStatus = 0;
   if (millis() - lastStatus > 500) {
     lastStatus = millis();
@@ -491,7 +641,7 @@ void loop() {
     updateStatusBar(gpsLock, (int)satellites, 8.7f);
   }
 
-  // ---- Bottom bar clock update ----
+  // ---- Clock update ----
   static uint32_t lastBottom = 0;
   if (millis() - lastBottom > 250) {
     lastBottom = millis();
@@ -500,7 +650,7 @@ void loop() {
                               clockSim.hh, clockSim.mi, clockSim.ss);
   }
 
-  // ---- NAV update every 2 seconds ----
+  // ---- NAV update (every 2 seconds) ----
   static uint32_t lastNav = 0;
   if (millis() - lastNav > 2000) {
     lastNav = millis();
@@ -518,47 +668,66 @@ void loop() {
     currLon = lon.lonitudeDegree;
     if (lon.lonDirection == 'W') currLon = -currLon;
 
-    // Current heading
-    sensors_event_t mag_event;
-    mag.getEvent(&mag_event);
-    float Pi = 3.14159f;
-    currentHeading = (atan2(mag_event.magnetic.y, mag_event.magnetic.x) * 180.0f) / Pi;
-    if (currentHeading < 0) currentHeading += 360.0f;
+    // Update course heading from GPS motion (if moved enough)
+    if (gpsLock) {
+      updateCourseHeading(currLat, currLon);
+    } else {
+      haveCourse = false;
+    }
 
-    currentDirStr = getCardinalDirection(currentHeading);
+    // Magnetometer heading (corrected)
+    float headingMag = getMagHeadingCW();
 
-    // Reload HOME (in case it was updated)
+    // Choose heading source:
+    // - If course heading is valid (moving), use it (usually better while walking)
+    // - Else use magnetometer (better when stationary)
+    if (haveCourse) {
+      headingUsed = courseHeading;
+      headingSrc = 'G';
+    } else {
+      headingUsed = headingMag;
+      headingSrc = 'M';
+    }
+    dirUsed = getCardinalDirection(headingUsed);
+
+    // Load HOME from JSON
     retrieveTargetFromLinux();
 
-    if (satellites > 0 && hasTarget) {
+    if (gpsLock && hasTarget) {
       angleToTarget = calculateBearing(currLat, currLon, targetLat, targetLon);
       targetDirStr = getCardinalDirection(angleToTarget);
 
-      distanceInMeters = calculateDistance(currLat, currLon, targetLat, targetLon);
+      distanceRaw = calculateDistance(currLat, currLon, targetLat, targetLon);
 
-      if (distanceInMeters >= 1000.0f) {
-        distanceStr = String(distanceInMeters / 1000.0f, 2) + " km";
+      // ✅ distance smoothing
+      if (distFilt < 0) distFilt = distanceRaw;
+      distFilt = distFilt + DIST_ALPHA * (distanceRaw - distFilt);
+
+      float distShow = distFilt;
+
+      if (distShow >= 1000.0f) {
+        distanceStr = String(distShow / 1000.0f, 2) + " km";
       } else {
-        distanceStr = String(distanceInMeters, 0) + " m";
+        distanceStr = String(distShow, 0) + " m";
       }
 
       haveNav = true;
-      updateBottomLeftDistance(distanceInMeters);
+      updateBottomLeftDistance(distShow);
 
-      // Arrow: angleToTarget is conventional bearing (0=N, 90=E).
-      // drawArrow uses (0=RIGHT, 90=DOWN).
-      // Map bearing to screen: screenAngle = bearing + 270 (wrap)
-      angle = wrap360(angleToTarget + 270.0f);
+      // Arrow: bearing CW-from-N -> screen angle (0=right, 90=down)
+      // N(0) should point UP => screen 270
+      arrowAngleScreen = wrap360(angleToTarget + 270.0f);
 
     } else {
       haveNav = false;
-      distanceInMeters = -1.0f;
+      distanceRaw = -1.0f;
+      distFilt = -1.0f;
       distanceStr = "--";
       updateBottomLeftDistance(-1.0f);
     }
 
     updateInfoPanel(currLat, currLon, altM,
-                    currentHeading, currentDirStr,
+                    headingUsed, dirUsed, headingSrc,
                     hasTarget, targetLat, targetLon, targetAlt,
                     haveNav, angleToTarget, targetDirStr,
                     distanceStr);
@@ -566,12 +735,12 @@ void loop() {
 
   // ---- Arrow draw/erase ----
   if (!isnan(prevAngle)) drawArrow(prevAngle, WHITE);
-  drawArrow(angle, MAGENTA);
-  prevAngle = angle;
+  drawArrow(arrowAngleScreen, MAGENTA);
+  prevAngle = arrowAngleScreen;
 
-  // If no nav yet, keep a slow demo spin
+  // if no nav yet, keep arrow alive
   if (!haveNav) {
-    angle = wrap360(angle + 3.0f);
+    arrowAngleScreen = wrap360(arrowAngleScreen + 3.0f);
   }
 
   delay(25);
