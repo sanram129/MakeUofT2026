@@ -23,8 +23,6 @@ static const int STATUS_H = 28;
 static const int BOTTOM_H = 38;
 static const int MARGIN   = 8;
 
-float prevAngle = NAN;
-
 // ================= BACKEND =================
 #define I2C_COMMUNICATION
 DFRobot_GNSSAndRTC_I2C gnss(&Wire, MODULE_I2C_ADDRESS);
@@ -40,19 +38,30 @@ float targetAlt = 0.0f;
 bool  hasTarget = false;
 
 // ---------- Tunables ----------
-static const uint32_t MAG_CAL_MS = 8000;     // rotate device for ~8s on boot
-static const float    DIST_ALPHA = 0.20f;    // distance smoothing 0.1..0.3
-static const float    COURSE_MIN_MOVE_M = 2.5f; // must move this much to trust course heading
-static const uint32_t COURSE_VALID_MS = 8000;   // course heading stays valid this long after last update
+static const uint32_t MAG_CAL_MS = 8000;         // rotate device for ~8s on boot
+static const float    DIST_ALPHA = 0.20f;        // distance smoothing 0.1..0.3
+static const float    COURSE_MIN_MOVE_M = 2.5f;  // must move this much to trust course heading
+static const uint32_t COURSE_VALID_MS = 8000;    // course heading stays valid this long after last update
 
 // If your headings are consistently off, tweak these:
-static const float MAG_DECLINATION_DEG = 0.0f;  // set to local declination if desired
+static const float MAG_DECLINATION_DEG = 0.0f;   // set to local declination if desired
 static const float MAG_HEADING_OFFSET_DEG = 0.0f;
 
 // If axis seems rotated or mirrored, flip these (0/1)
 #define MAG_SWAP_XY   0
 #define MAG_INVERT_X  0
 #define MAG_INVERT_Y  0
+
+// ================= LAYOUT (INFO PANEL + ARROW AREA) =================
+// Info panel moved/defined explicitly
+static const int INFO_X = MARGIN;
+static const int INFO_Y = STATUS_H + MARGIN;
+static const int INFO_W = 260;   // wider than before
+static const int INFO_H = 170;   // taller than before
+
+// Arrow area lives to the right of the info panel
+int ARROW_X=0, ARROW_Y=0, ARROW_W=0, ARROW_H=0;
+int ARROW_CX=0, ARROW_CY=0;
 
 // ---------- Helpers ----------
 static float wrap360(float x) {
@@ -86,7 +95,7 @@ static bool waitForPython(uint32_t timeoutMs = 10000) {
   return started;
 }
 
-// ✅ FIXED: Standard CW-from-North mapping (0=N, 90=E, 180=S, 270=W)
+// ✅ Standard CW-from-North mapping (0=N, 90=E, 180=S, 270=W)
 String getCardinalDirection(float heading) {
   heading = wrap360(heading);
   if (heading >= 337.5f || heading < 22.5f)  return "N";
@@ -100,7 +109,7 @@ String getCardinalDirection(float heading) {
   return "?";
 }
 
-// Haversine distance
+// Haversine distance (meters)
 float calculateDistance(float currLat, float currLon, float destLat, float destLon) {
   float R = 6371000.0f;
   float lat1 = currLat * PI / 180.0f;
@@ -119,7 +128,7 @@ float calculateDistance(float currLat, float currLon, float destLat, float destL
   return R * c;
 }
 
-// Bearing CW-from-North
+// Bearing CW-from-North (degrees)
 float calculateBearing(float currLat, float currLon, float destLat, float destLon) {
   float lat1 = currLat * PI / 180.0f;
   float lon1 = currLon * PI / 180.0f;
@@ -403,13 +412,7 @@ void drawThickLine(int x0, int y0, int x1, int y1, int thickness, uint16_t color
   }
 }
 
-void drawArrow(float angleDeg, uint16_t color) {
-  int W = TFT.width();
-  int H = TFT.height();
-
-  int cx = W / 2;
-  int cy = (STATUS_H + (H - BOTTOM_H)) / 2;
-
+void drawArrowAt(int cx, int cy, float angleDeg, uint16_t color) {
   int shaftLen = 70;
   int shaftLenBack = 10;
   int thickness = 6;
@@ -476,11 +479,9 @@ struct SoftClock {
 
 // ================= Info Panel =================
 static void drawInfoPanelFrame() {
-  int x = MARGIN;
-  int y = STATUS_H + MARGIN;
-  int w = 240;
-  int h = 150; // enough for home lines too
-  TFT.drawRect(x, y, w, h, BLACK);
+  // draw once initially
+  TFT.fillRect(INFO_X, INFO_Y, INFO_W, INFO_H, WHITE);
+  TFT.drawRect(INFO_X, INFO_Y, INFO_W, INFO_H, BLACK);
 }
 
 static void updateInfoPanel(float currLat, float currLon, float altM,
@@ -490,33 +491,33 @@ static void updateInfoPanel(float currLat, float currLon, float altM,
                             bool haveTargetData,
                             float angleToTarget, const String &targetDir,
                             const String &distanceStr) {
-  int x = MARGIN + 1;
-  int y = STATUS_H + MARGIN + 1;
-  int w = 240 - 2;
-  int h = 150 - 2;
 
-  TFT.fillRect(x, y, w, h, WHITE);
+  // Clear ENTIRE panel and redraw border to avoid overlay artifacts
+  TFT.fillRect(INFO_X, INFO_Y, INFO_W, INFO_H, WHITE);
+  TFT.drawRect(INFO_X, INFO_Y, INFO_W, INFO_H, BLACK);
+
   TFT.setTextSize(2);
   TFT.setTextColor(BLACK, WHITE);
 
-  int cy = y + 4;
+  int x = INFO_X + 6;
+  int cy = INFO_Y + 6;
 
   // current
-  TFT.setCursor(x + 6, cy); TFT.print("LAT: "); TFT.print(currLat, 6); cy += 18;
-  TFT.setCursor(x + 6, cy); TFT.print("LON: "); TFT.print(currLon, 6); cy += 18;
-  TFT.setCursor(x + 6, cy); TFT.print("ALT: "); TFT.print(altM, 1); TFT.print("m"); cy += 18;
+  TFT.setCursor(x, cy); TFT.print("LAT: "); TFT.print(currLat, 6); cy += 18;
+  TFT.setCursor(x, cy); TFT.print("LON: "); TFT.print(currLon, 6); cy += 18;
+  TFT.setCursor(x, cy); TFT.print("ALT: "); TFT.print(altM, 1); TFT.print("m"); cy += 18;
 
   // home
   if (haveHome) {
-    TFT.setCursor(x + 6, cy); TFT.print("HLA: "); TFT.print(homeLat, 6); cy += 18;
-    TFT.setCursor(x + 6, cy); TFT.print("HLN: "); TFT.print(homeLon, 6); cy += 18;
+    TFT.setCursor(x, cy); TFT.print("HLA: "); TFT.print(homeLat, 6); cy += 18;
+    TFT.setCursor(x, cy); TFT.print("HLN: "); TFT.print(homeLon, 6); cy += 18;
   } else {
-    TFT.setCursor(x + 6, cy); TFT.print("HLA: --"); cy += 18;
-    TFT.setCursor(x + 6, cy); TFT.print("HLN: --"); cy += 18;
+    TFT.setCursor(x, cy); TFT.print("HLA: --"); cy += 18;
+    TFT.setCursor(x, cy); TFT.print("HLN: --"); cy += 18;
   }
 
   // heading
-  TFT.setCursor(x + 6, cy);
+  TFT.setCursor(x, cy);
   TFT.print("HDG: "); TFT.print(headingUsedDeg, 1); TFT.print(" ");
   TFT.print(dirUsed); TFT.print(" ");
   TFT.print(headingSrc); // 'G' or 'M'
@@ -524,15 +525,15 @@ static void updateInfoPanel(float currLat, float currLon, float altM,
 
   // bearing + distance
   if (haveTargetData) {
-    TFT.setCursor(x + 6, cy);
+    TFT.setCursor(x, cy);
     TFT.print("BRG: "); TFT.print(angleToTarget, 1); TFT.print(" "); TFT.print(targetDir);
     cy += 18;
 
-    TFT.setCursor(x + 6, cy);
+    TFT.setCursor(x, cy);
     TFT.print("DST: "); TFT.print(distanceStr);
   } else {
-    TFT.setCursor(x + 6, cy); TFT.print("BRG: --"); cy += 18;
-    TFT.setCursor(x + 6, cy); TFT.print("DST: --");
+    TFT.setCursor(x, cy); TFT.print("BRG: --"); cy += 18;
+    TFT.setCursor(x, cy); TFT.print("DST: --");
   }
 }
 
@@ -562,6 +563,18 @@ void setup() {
   TFT.setRotation(1);
   TFT.fillScreen(WHITE);
 
+  // Compute arrow area on the RIGHT of the info panel
+  ARROW_X = INFO_X + INFO_W + MARGIN;
+  ARROW_Y = STATUS_H;
+  ARROW_W = TFT.width()  - ARROW_X - MARGIN;
+  ARROW_H = TFT.height() - STATUS_H - BOTTOM_H;
+
+  if (ARROW_W < 40) ARROW_W = 40;
+  if (ARROW_H < 40) ARROW_H = 40;
+
+  ARROW_CX = ARROW_X + ARROW_W / 2;
+  ARROW_CY = ARROW_Y + ARROW_H / 2;
+
   drawStatusBarFrame();
   drawBottomBarFrame();
   drawInfoPanelFrame();
@@ -571,14 +584,14 @@ void setup() {
   updateBottomRightDateTime(clockSim.yy, clockSim.mm, clockSim.dd,
                             clockSim.hh, clockSim.mi, clockSim.ss);
 
-  int cx = TFT.width() / 2;
-  int cy = (STATUS_H + (TFT.height() - BOTTOM_H)) / 2;
-  TFT.fillCircle(cx, cy, 3, BLACK);
+  // Clear arrow area + center dot
+  TFT.fillRect(ARROW_X, ARROW_Y, ARROW_W, ARROW_H, WHITE);
+  TFT.fillCircle(ARROW_CX, ARROW_CY, 3, BLACK);
 
   // Load HOME if exists
   retrieveTargetFromLinux();
 
-  // Do a one-time calibration on boot
+  // One-time calibration on boot
   TFT.setTextSize(2);
   TFT.setTextColor(BLACK, WHITE);
   TFT.setCursor(MARGIN, STATUS_H + MARGIN + 160);
@@ -679,8 +692,8 @@ void loop() {
     float headingMag = getMagHeadingCW();
 
     // Choose heading source:
-    // - If course heading is valid (moving), use it (usually better while walking)
-    // - Else use magnetometer (better when stationary)
+    // - If course heading is valid (moving), use it
+    // - Else use magnetometer (stationary)
     if (haveCourse) {
       headingUsed = courseHeading;
       headingSrc = 'G';
@@ -699,7 +712,7 @@ void loop() {
 
       distanceRaw = calculateDistance(currLat, currLon, targetLat, targetLon);
 
-      // ✅ distance smoothing
+      // distance smoothing
       if (distFilt < 0) distFilt = distanceRaw;
       distFilt = distFilt + DIST_ALPHA * (distanceRaw - distFilt);
 
@@ -733,12 +746,12 @@ void loop() {
                     distanceStr);
   }
 
-  // ---- Arrow draw/erase ----
-  if (!isnan(prevAngle)) drawArrow(prevAngle, WHITE);
-  drawArrow(arrowAngleScreen, MAGENTA);
-  prevAngle = arrowAngleScreen;
+  // ---- Arrow draw (clean: redraw only inside arrow area) ----
+  TFT.fillRect(ARROW_X, ARROW_Y, ARROW_W, ARROW_H, WHITE);
+  TFT.fillCircle(ARROW_CX, ARROW_CY, 3, BLACK);
+  drawArrowAt(ARROW_CX, ARROW_CY, arrowAngleScreen, MAGENTA);
 
-  // if no nav yet, keep arrow alive
+  // If no nav yet, keep arrow alive
   if (!haveNav) {
     arrowAngleScreen = wrap360(arrowAngleScreen + 3.0f);
   }
