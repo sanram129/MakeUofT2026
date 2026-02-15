@@ -10,7 +10,7 @@
 DFRobot_GNSSAndRTC_I2C gnss(&Wire, MODULE_I2C_ADDRESS);
 Adafruit_LIS2MDL mag = Adafruit_LIS2MDL(12345);
 
-const int buttonPin = A1;
+const int buttonPin = A5;
 int lastButtonState = HIGH;
 
 // Global variables to hold the retrieved JSON target
