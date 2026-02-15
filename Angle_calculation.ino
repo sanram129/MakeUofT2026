@@ -168,11 +168,13 @@ void loop() {
   float currLon = lon.lonitudeDegree;
   if (lon.lonDirection == 'W') currLon = -currLon;
 
-  // 2. Get Live Compass Heading
+  // 2. Get Live Compass Heading (INVERTED Y-AXIS TO FIX EAST/WEST)
   sensors_event_t mag_event;
   mag.getEvent(&mag_event);
   float Pi = 3.14159;
-  float currentHeading = (atan2(mag_event.magnetic.y, mag_event.magnetic.x) * 180) / Pi;
+  
+  // Notice the negative sign added to the Y component below:
+  float currentHeading = (atan2(-mag_event.magnetic.y, mag_event.magnetic.x) * 180) / Pi;
   if (currentHeading < 0) currentHeading += 360;
 
   // ----------------------------------------------------
