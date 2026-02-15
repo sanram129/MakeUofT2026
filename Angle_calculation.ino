@@ -30,7 +30,41 @@ static bool waitForPython(uint32_t timeoutMs = 10000) {
   return started;
 }
 
-// Math function to calculate the Compass Bearing between two geographical points
+// Convert 360 Degree Angle to Cardinal String
+String getCardinalDirection(float heading) {
+  if (heading >= 337.5 || heading < 22.5)  return "N";
+  if (heading >= 22.5  && heading < 67.5)  return "NE";
+  if (heading >= 67.5  && heading < 112.5) return "E";
+  if (heading >= 112.5 && heading < 157.5) return "SE";
+  if (heading >= 157.5 && heading < 202.5) return "S";
+  if (heading >= 202.5 && heading < 247.5) return "SW";
+  if (heading >= 247.5 && heading < 292.5) return "W";
+  if (heading >= 292.5 && heading < 337.5) return "NW";
+  return "?"; 
+}
+
+// NEW: Math function to calculate distance in meters (Haversine Formula)
+float calculateDistance(float currLat, float currLon, float destLat, float destLon) {
+  float R = 6371000.0; // Radius of Earth in meters
+  
+  float lat1 = currLat * PI / 180.0;
+  float lon1 = currLon * PI / 180.0;
+  float lat2 = destLat * PI / 180.0;
+  float lon2 = destLon * PI / 180.0;
+
+  float dLat = lat2 - lat1;
+  float dLon = lon2 - lon1;
+
+  float a = sin(dLat / 2.0) * sin(dLat / 2.0) +
+            cos(lat1) * cos(lat2) *
+            sin(dLon / 2.0) * sin(dLon / 2.0);
+            
+  float c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+  
+  return R * c; // Returns distance in meters
+}
+
+// Math function to calculate the Compass Bearing
 float calculateBearing(float currLat, float currLon, float destLat, float destLon) {
   float lat1 = currLat * PI / 180.0;
   float lon1 = currLon * PI / 180.0;
@@ -51,7 +85,7 @@ float calculateBearing(float currLat, float currLon, float destLat, float destLo
 // Character-by-Character Retrieval Function
 void retrieveTargetFromLinux() {
   String recoveredGPS = "";
-  Bridge.call("load_gps"); // Prepares the char list in Python
+  Bridge.call("load_gps"); 
   
   String inputStr = ""; 
   bool endReached = false;
@@ -65,11 +99,10 @@ void retrieveTargetFromLinux() {
         recoveredGPS += inputStr.charAt(0);
       }
     }
-    delay(5); // Prevent overwhelming the Bridge
+    delay(5); 
   }
   Bridge.call("reset_iteration");
 
-  // Parse the reconstructed CSV string (e.g., "43.589,N,-79.644,W,156.2")
   if (recoveredGPS != "No Data" && recoveredGPS != "error" && recoveredGPS != "") {
     int idx1 = recoveredGPS.indexOf(',');
     int idx2 = recoveredGPS.indexOf(',', idx1 + 1);
@@ -83,7 +116,6 @@ void retrieveTargetFromLinux() {
       float tLon = recoveredGPS.substring(idx2 + 1, idx3).toFloat();
       String lonDir = recoveredGPS.substring(idx3 + 1, idx4);
       
-      // Convert S and W to negative floats for accurate mathematical calculation
       if (latDir == "S") tLat = -tLat;
       if (lonDir == "W") tLon = -tLon;
 
@@ -95,7 +127,6 @@ void retrieveTargetFromLinux() {
     hasTarget = false;
   }
 }
-
 
 void setup() {
   Monitor.begin(9600);
@@ -120,7 +151,6 @@ void setup() {
   Monitor.println("========================================\n");
 }
 
-
 void loop() {
   Bridge.update();
 
@@ -132,7 +162,6 @@ void loop() {
   double alt = gnss.getAlt();
   uint8_t satellites = gnss.getNumSatUsed();
 
-  // Convert current coordinates to proper math floats (+/-)
   float currLat = lat.latitudeDegree;
   if (lat.latDirection == 'S') currLat = -currLat;
   
@@ -165,7 +194,7 @@ void loop() {
     } else {
       Monitor.println("\n[WARNING] Cannot save: Waiting for Satellite Lock...");
     }
-    delay(200); // Debounce
+    delay(200); 
   }
   lastButtonState = currentButtonState;
 
@@ -173,24 +202,42 @@ void loop() {
   // CONTINUOUS LOOP LOGIC (Every 2 seconds)
   // ----------------------------------------------------
   static unsigned long lastUpdate = 0;
-  if (millis() - lastUpdate > 1000) {
+  if (millis() - lastUpdate > 2000) {
     lastUpdate = millis();
     
-    // Continuously pull the target data char-by-char from Python
     retrieveTargetFromLinux();
     
+    String currentDirStr = getCardinalDirection(currentHeading);
+    
     Monitor.println("--- Navigation Readout ---");
-    Monitor.print("Current Heading:   "); Monitor.print(currentHeading, 1); Monitor.println("°");
+    Monitor.print("Current Heading:   "); 
+    Monitor.print(currentHeading, 1); 
+    Monitor.print("° ("); Monitor.print(currentDirStr); Monitor.println(")");
     
     if (satellites > 0 && hasTarget) {
-      // Calculate the angle to the waypoint!
+      
+      // Calculate Angle & Distance
       float angleToTarget = calculateBearing(currLat, currLon, targetLat, targetLon);
+      String targetDirStr = getCardinalDirection(angleToTarget);
+      
+      float distanceInMeters = calculateDistance(currLat, currLon, targetLat, targetLon);
       
       Monitor.print("Target Bearing:    "); 
-      Monitor.print(angleToTarget, 1); Monitor.println("°");
-      Monitor.print("Distance to Turn:  "); 
+      Monitor.print(angleToTarget, 1); 
+      Monitor.print("° ("); Monitor.print(targetDirStr); Monitor.println(")");
       
-      // Figure out if you need to turn Left or Right to face the target
+      // NEW: Dynamic Distance Printout (Meters vs Kilometers)
+      Monitor.print("Distance to Target: "); 
+      if (distanceInMeters >= 1000.0) {
+        Monitor.print(distanceInMeters / 1000.0, 2); 
+        Monitor.println(" km");
+      } else {
+        Monitor.print(distanceInMeters, 0); 
+        Monitor.println(" m");
+      }
+      
+      Monitor.print("Turn Instruction:  "); 
+      
       float turnAngle = angleToTarget - currentHeading;
       if (turnAngle < -180) turnAngle += 360;
       if (turnAngle > 180) turnAngle -= 360;
