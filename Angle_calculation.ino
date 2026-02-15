@@ -173,7 +173,7 @@ void loop() {
   // CONTINUOUS LOOP LOGIC (Every 2 seconds)
   // ----------------------------------------------------
   static unsigned long lastUpdate = 0;
-  if (millis() - lastUpdate > 2000) {
+  if (millis() - lastUpdate > 1000) {
     lastUpdate = millis();
     
     // Continuously pull the target data char-by-char from Python
