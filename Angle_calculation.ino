@@ -43,7 +43,7 @@ String getCardinalDirection(float heading) {
   return "?"; 
 }
 
-// NEW: Math function to calculate distance in meters (Haversine Formula)
+// Math function to calculate distance in meters (Haversine Formula)
 float calculateDistance(float currLat, float currLon, float destLat, float destLon) {
   float R = 6371000.0; // Radius of Earth in meters
   
@@ -61,7 +61,7 @@ float calculateDistance(float currLat, float currLon, float destLat, float destL
             
   float c = 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
   
-  return R * c; // Returns distance in meters
+  return R * c; 
 }
 
 // Math function to calculate the Compass Bearing
@@ -226,15 +226,16 @@ void loop() {
       Monitor.print(angleToTarget, 1); 
       Monitor.print("° ("); Monitor.print(targetDirStr); Monitor.println(")");
       
-      // NEW: Dynamic Distance Printout (Meters vs Kilometers)
-      Monitor.print("Distance to Target: "); 
+      // Convert distance to a formatted String
+      String distanceStr = "";
       if (distanceInMeters >= 1000.0) {
-        Monitor.print(distanceInMeters / 1000.0, 2); 
-        Monitor.println(" km");
+        distanceStr = String(distanceInMeters / 1000.0, 2) + " km";
       } else {
-        Monitor.print(distanceInMeters, 0); 
-        Monitor.println(" m");
+        distanceStr = String(distanceInMeters, 0) + " m";
       }
+      
+      Monitor.print("Distance to Target: "); 
+      Monitor.println(distanceStr);
       
       Monitor.print("Turn Instruction:  "); 
       
@@ -249,10 +250,13 @@ void loop() {
       } else {
         Monitor.print("Turn LEFT "); Monitor.print(abs(turnAngle), 0); Monitor.println("°");
       }
+      
     } else if (satellites == 0) {
       Monitor.println("Target Bearing:    [Awaiting GPS Lock]");
+      Monitor.println("Distance to Target: distance unavailable");
     } else {
       Monitor.println("Target Bearing:    [No Target Saved]");
+      Monitor.println("Distance to Target: [No Target Saved]");
     }
     Monitor.println("");
   }
