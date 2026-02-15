@@ -6,8 +6,7 @@
 #define I2C_COMMUNICATION 
 DFRobot_GNSSAndRTC_I2C gnss(&Wire, MODULE_I2C_ADDRESS);
 
-// Button (Must be on A1 to prevent clashing with I2C SCL on A5)
-const int buttonPin = A1;
+const int buttonPin = A5;
 int lastButtonState = HIGH;
 
 static bool waitForPython(uint32_t timeoutMs = 10000) {
