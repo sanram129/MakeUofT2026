@@ -83,4 +83,49 @@ void loop() {
   if (lastButtonState == HIGH && currentButtonState == LOW) {
     
     // 1. Get GPS Data
-    DFRobot_GNSSAndRTC::sLonLat
+    DFRobot_GNSSAndRTC::sLonLat_t lat = gnss.getLat();
+    DFRobot_GNSSAndRTC::sLonLat_t lon = gnss.getLon();
+    double alt = gnss.getAlt();
+    uint8_t satellites = gnss.getNumSatUsed();
+
+    // Only attempt to save if the GPS has actual data from space
+    if (satellites > 0) {
+      
+      // 2. Format Data into a clean, comma-separated list for Python to parse
+      // Format: "Latitude,LatDir,Longitude,LonDir,Altitude"
+      String gpsStr = String(lat.latitudeDegree, 6) + "," + 
+                      String((char)lat.latDirection) + "," + 
+                      String(lon.lonitudeDegree, 6) + "," + 
+                      String((char)lon.lonDirection) + "," + 
+                      String(alt, 2);
+      
+      // 3. Send to Python via Bridge
+      bool ok = false;
+      RpcCall c = Bridge.call("save_gps", gpsStr);
+      
+      if (c.result(ok) && ok) {
+        Monitor.print("=> Sent to Linux: ");
+        Monitor.println(gpsStr);
+
+        // Verify immediate load to ensure Python processed the JSON correctly
+        String verifyStr = "";
+        RpcCall v = Bridge.call("verify_gps");
+        if (v.result(verifyStr)) {
+          Monitor.print("=> Verified JSON: ");
+          Monitor.println(verifyStr);
+        }
+        Monitor.println("-----------------------------------");
+      } else {
+        Monitor.println("=> Save FAILED via Bridge");
+      }
+    } else {
+      Monitor.println("=> Cannot save: Waiting for Satellite Lock... (Go Outside!)");
+    }
+    
+    // Debounce delay
+    delay(200); 
+  }
+
+  lastButtonState = currentButtonState;
+  delay(10);
+}
