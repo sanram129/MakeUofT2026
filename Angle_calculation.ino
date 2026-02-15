@@ -52,12 +52,19 @@ static const float MAG_HEADING_OFFSET_DEG = 0.0f;
 #define MAG_INVERT_X  0
 #define MAG_INVERT_Y  0
 
+// ---------- TIMEZONE ----------
+// GNSS time is UTC. Set offset minutes if you want local time.
+// Examples:
+//  UTC   = 0
+//  UTC-5 = -300
+//  UTC-4 = -240
+static const int TIMEZONE_OFFSET_MIN = 0;
+
 // ================= LAYOUT (INFO PANEL + ARROW AREA) =================
-// Info panel moved/defined explicitly
 static const int INFO_X = MARGIN;
 static const int INFO_Y = STATUS_H + MARGIN;
-static const int INFO_W = 260;   // wider than before
-static const int INFO_H = 170;   // taller than before
+static const int INFO_W = 260;
+static const int INFO_H = 170;
 
 // Arrow area lives to the right of the info panel
 int ARROW_X=0, ARROW_Y=0, ARROW_W=0, ARROW_H=0;
@@ -80,6 +87,38 @@ static float wrap180(float x) {
 static float smoothAngle(float prev, float now, float alpha) {
   float d = wrap180(now - prev);
   return wrap360(prev + alpha * d);
+}
+
+// ---- Date helpers (for timezone adjustment + ticking) ----
+static bool isLeapYear(int y) { return (y%400==0) || (y%4==0 && y%100!=0); }
+static int daysInMonth(int y, int m) {
+  static const int d[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  if (m == 2) return d[m-1] + (isLeapYear(y) ? 1 : 0);
+  return d[m-1];
+}
+
+static void incOneDay(int &yy, int &mm, int &dd) {
+  dd++;
+  int dim = daysInMonth(yy, mm);
+  if (dd > dim) { dd = 1; mm++; }
+  if (mm > 12) { mm = 1; yy++; }
+}
+
+static void decOneDay(int &yy, int &mm, int &dd) {
+  dd--;
+  if (dd < 1) {
+    mm--;
+    if (mm < 1) { mm = 12; yy--; }
+    dd = daysInMonth(yy, mm);
+  }
+}
+
+static void addMinutesToDateTime(int &yy, int &mm, int &dd, int &hh, int &mi, int deltaMin) {
+  int total = hh * 60 + mi + deltaMin;
+  while (total < 0) { total += 1440; decOneDay(yy, mm, dd); }
+  while (total >= 1440) { total -= 1440; incOneDay(yy, mm, dd); }
+  hh = total / 60;
+  mi = total % 60;
 }
 
 // ---------- Bridge wait ----------
@@ -208,16 +247,11 @@ float getMagHeadingCW() {
   y = -y;
 #endif
 
-  // hard/soft-iron correction
   float mx = (x - magOffX) * magScaleX;
   float my = (y - magOffY) * magScaleY;
 
-  // raw angle CCW from +X
-  float raw = atan2(my, mx) * 180.0f / PI;
-
-  // convert to CW-from-North
-  float heading = wrap360(90.0f - raw);
-
+  float raw = atan2(my, mx) * 180.0f / PI;     // CCW from +X
+  float heading = wrap360(90.0f - raw);        // CW-from-N
   heading = wrap360(heading + MAG_DECLINATION_DEG + MAG_HEADING_OFFSET_DEG);
   return heading;
 }
@@ -246,7 +280,6 @@ void updateCourseHeading(float currLat, float currLon) {
 
   float stepDist = calculateDistance(prevFixLat, prevFixLon, currLat, currLon);
 
-  // only accept course if we actually moved (filters jitter)
   if (stepDist >= COURSE_MIN_MOVE_M) {
     float newCourse = calculateBearing(prevFixLat, prevFixLon, currLat, currLon);
 
@@ -258,13 +291,11 @@ void updateCourseHeading(float currLat, float currLon) {
     }
     lastCourseMs = now;
 
-    // update baseline ONLY when moved enough
     prevFixLat = currLat;
     prevFixLon = currLon;
     prevFixMs  = now;
   }
 
-  // expire if old
   if (haveCourse && (now - lastCourseMs > COURSE_VALID_MS)) {
     haveCourse = false;
   }
@@ -380,16 +411,14 @@ void updateBottomLeftDistance(float distM) {
   }
 }
 
-void updateBottomRightDateTime(int yy, int mm, int dd, int hh, int mi, int ss) {
+// generic right-side text writer (so we can show placeholders until GNSS sync)
+void updateBottomRightText(const char *buf) {
   int W = TFT.width();
   int H = TFT.height();
   int y0 = H - BOTTOM_H;
 
   TFT.setTextSize(2);
   TFT.setTextColor(BLACK, GRAY);
-
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%02d:%02d:%02d  %04d-%02d-%02d", hh, mi, ss, yy, mm, dd);
 
   int len = (int)strlen(buf);
   int approxCharW = 6 * 2;
@@ -399,9 +428,14 @@ void updateBottomRightDateTime(int yy, int mm, int dd, int hh, int mi, int ss) {
   if (x < 0) x = 0;
 
   TFT.fillRect(x - 4, y0 + 1, textW + 10, BOTTOM_H - 2, GRAY);
-
   TFT.setCursor(x, y0 + 10);
   TFT.print(buf);
+}
+
+void updateBottomRightDateTime(int yy, int mm, int dd, int hh, int mi, int ss) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%02d:%02d:%02d  %04d-%02d-%02d", hh, mi, ss, yy, mm, dd);
+  updateBottomRightText(buf);
 }
 
 // ================= Arrow Drawing =================
@@ -449,19 +483,21 @@ void drawArrowAt(int cx, int cy, float angleDeg, uint16_t color) {
   TFT.fillTriangle(xTip, yTip, xL, yL, xR, yR, color);
 }
 
-// ================= Demo “Clock” =================
+// ================= GNSS-Synced Clock =================
 struct SoftClock {
-  int yy=2026, mm=2, dd=14;
-  int hh=12, mi=0, ss=0;
+  int yy=2000, mm=1, dd=1;
+  int hh=0, mi=0, ss=0;
   uint32_t lastMs=0;
+  bool valid=false;
 
-  static bool isLeap(int y){ return (y%400==0) || (y%4==0 && y%100!=0); }
-  static int daysInMonth(int y,int m){
-    static const int d[12]={31,28,31,30,31,30,31,31,30,31,30,31};
-    if(m==2) return d[m-1] + (isLeap(y)?1:0);
-    return d[m-1];
+  void set(int y,int m,int d,int h,int mn,int s) {
+    yy=y; mm=m; dd=d; hh=h; mi=mn; ss=s;
+    lastMs = millis();
+    valid = true;
   }
+
   void tick() {
+    if (!valid) return;
     uint32_t now = millis();
     if (lastMs == 0) lastMs = now;
     while (now - lastMs >= 1000) {
@@ -469,17 +505,40 @@ struct SoftClock {
       ss++;
       if (ss >= 60) { ss=0; mi++; }
       if (mi >= 60) { mi=0; hh++; }
-      if (hh >= 24) { hh=0; dd++; }
-      int dim = daysInMonth(yy, mm);
-      if (dd > dim) { dd=1; mm++; }
-      if (mm > 12) { mm=1; yy++; }
+      if (hh >= 24) { hh=0; incOneDay(yy, mm, dd); }
     }
   }
 } clockSim;
 
+// Try syncing from GNSS UTC+Date; returns true if updated
+static bool syncClockFromGNSS() {
+  DFRobot_GNSSAndRTC::sTim_t utc  = gnss.getUTC();
+  DFRobot_GNSSAndRTC::sTim_t date = gnss.getDate();
+
+  // sanity check
+  if (date.year < 2000 || date.year > 2099) return false;
+  if (date.month < 1 || date.month > 12) return false;
+  if (date.date < 1 || date.date > 31) return false;
+  if (utc.hour > 23 || utc.minute > 59 || utc.second > 59) return false;
+
+  int yy = (int)date.year;
+  int mm = (int)date.month;
+  int dd = (int)date.date;
+  int hh = (int)utc.hour;
+  int mi = (int)utc.minute;
+  int ss = (int)utc.second;
+
+  // apply timezone offset if desired
+  if (TIMEZONE_OFFSET_MIN != 0) {
+    addMinutesToDateTime(yy, mm, dd, hh, mi, TIMEZONE_OFFSET_MIN);
+  }
+
+  clockSim.set(yy, mm, dd, hh, mi, ss);
+  return true;
+}
+
 // ================= Info Panel =================
 static void drawInfoPanelFrame() {
-  // draw once initially
   TFT.fillRect(INFO_X, INFO_Y, INFO_W, INFO_H, WHITE);
   TFT.drawRect(INFO_X, INFO_Y, INFO_W, INFO_H, BLACK);
 }
@@ -502,12 +561,10 @@ static void updateInfoPanel(float currLat, float currLon, float altM,
   int x = INFO_X + 6;
   int cy = INFO_Y + 6;
 
-  // current
   TFT.setCursor(x, cy); TFT.print("LAT: "); TFT.print(currLat, 6); cy += 18;
   TFT.setCursor(x, cy); TFT.print("LON: "); TFT.print(currLon, 6); cy += 18;
   TFT.setCursor(x, cy); TFT.print("ALT: "); TFT.print(altM, 1); TFT.print("m"); cy += 18;
 
-  // home
   if (haveHome) {
     TFT.setCursor(x, cy); TFT.print("HLA: "); TFT.print(homeLat, 6); cy += 18;
     TFT.setCursor(x, cy); TFT.print("HLN: "); TFT.print(homeLon, 6); cy += 18;
@@ -516,14 +573,12 @@ static void updateInfoPanel(float currLat, float currLon, float altM,
     TFT.setCursor(x, cy); TFT.print("HLN: --"); cy += 18;
   }
 
-  // heading
   TFT.setCursor(x, cy);
   TFT.print("HDG: "); TFT.print(headingUsedDeg, 1); TFT.print(" ");
   TFT.print(dirUsed); TFT.print(" ");
-  TFT.print(headingSrc); // 'G' or 'M'
+  TFT.print(headingSrc);
   cy += 18;
 
-  // bearing + distance
   if (haveTargetData) {
     TFT.setCursor(x, cy);
     TFT.print("BRG: "); TFT.print(angleToTarget, 1); TFT.print(" "); TFT.print(targetDir);
@@ -581,8 +636,7 @@ void setup() {
 
   updateStatusBar(false, 0, 8.7f);
   updateBottomLeftDistance(-1.0f);
-  updateBottomRightDateTime(clockSim.yy, clockSim.mm, clockSim.dd,
-                            clockSim.hh, clockSim.mi, clockSim.ss);
+  updateBottomRightText("--:--:--  ---- -- --");
 
   // Clear arrow area + center dot
   TFT.fillRect(ARROW_X, ARROW_Y, ARROW_W, ARROW_H, WHITE);
@@ -654,13 +708,18 @@ void loop() {
     updateStatusBar(gpsLock, (int)satellites, 8.7f);
   }
 
-  // ---- Clock update ----
+  // ---- Clock update (ticks locally; GNSS sync happens below) ----
   static uint32_t lastBottom = 0;
   if (millis() - lastBottom > 250) {
     lastBottom = millis();
     clockSim.tick();
-    updateBottomRightDateTime(clockSim.yy, clockSim.mm, clockSim.dd,
-                              clockSim.hh, clockSim.mi, clockSim.ss);
+
+    if (clockSim.valid) {
+      updateBottomRightDateTime(clockSim.yy, clockSim.mm, clockSim.dd,
+                                clockSim.hh, clockSim.mi, clockSim.ss);
+    } else {
+      updateBottomRightText("--:--:--  ---- -- --");
+    }
   }
 
   // ---- NAV update (every 2 seconds) ----
@@ -681,6 +740,11 @@ void loop() {
     currLon = lon.lonitudeDegree;
     if (lon.lonDirection == 'W') currLon = -currLon;
 
+    // ✅ Sync time from GNSS when we have lock
+    if (gpsLock) {
+      syncClockFromGNSS();
+    }
+
     // Update course heading from GPS motion (if moved enough)
     if (gpsLock) {
       updateCourseHeading(currLat, currLon);
@@ -691,9 +755,7 @@ void loop() {
     // Magnetometer heading (corrected)
     float headingMag = getMagHeadingCW();
 
-    // Choose heading source:
-    // - If course heading is valid (moving), use it
-    // - Else use magnetometer (stationary)
+    // Choose heading source
     if (haveCourse) {
       headingUsed = courseHeading;
       headingSrc = 'G';
