@@ -38,6 +38,12 @@ float targetLat = 0.0;
 float targetLon = 0.0;
 bool hasTarget = false;
 
+static float wrap360(float x) {
+  while (x < 0.0f) x += 360.0f;
+  while (x >= 360.0f) x -=360.0f;
+  return x;
+}
+
 // ---------- Bridge wait ----------
 static bool waitForPython(uint32_t timeoutMs = 10000) {
   bool started = false;
@@ -509,7 +515,7 @@ void loop() {
       // Your codebase + cardinal mapping are using 0=N with CCW increasing.
       // calculateBearing() returns the conventional CW bearing.
       // Convert CW -> CCW so the UI matches your cardinal mapping:
-      angleToTarget = fmodf(360.0f - bearingCW, 360.0f);
+      angleToTarget = wrap360(360.0f - bearingCW);
 
       targetDirStr = getCardinalDirection(angleToTarget);
 
@@ -528,8 +534,7 @@ void loop() {
 
       // Arrow: UI drawArrow uses screen-angle (0=RIGHT, 90=DOWN).
       // For CCW-from-North angleToTarget: screenAngle = (270 - angleToTarget) mod 360
-      float screenAngle = fmodf(270.0f - angleToTarget, 360.0f);
-      if (screenAngle < 0) screenAngle += 360.0f;
+      float screenAngle = wrap360(270.0f - angleToTarget);
       angle = screenAngle;
 
     } else {
