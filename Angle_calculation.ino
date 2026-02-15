@@ -33,13 +33,13 @@ static bool waitForPython(uint32_t timeoutMs = 10000) {
 // Convert 360 Degree Angle to Cardinal String
 String getCardinalDirection(float heading) {
   if (heading >= 337.5 || heading < 22.5)  return "N";
-  if (heading >= 22.5  && heading < 67.5)  return "NE";
-  if (heading >= 67.5  && heading < 112.5) return "E";
-  if (heading >= 112.5 && heading < 157.5) return "SE";
+  if (heading >= 22.5  && heading < 67.5)  return "NW";
+  if (heading >= 67.5  && heading < 112.5) return "W";
+  if (heading >= 112.5 && heading < 157.5) return "SW";
   if (heading >= 157.5 && heading < 202.5) return "S";
-  if (heading >= 202.5 && heading < 247.5) return "SW";
-  if (heading >= 247.5 && heading < 292.5) return "W";
-  if (heading >= 292.5 && heading < 337.5) return "NW";
+  if (heading >= 202.5 && heading < 247.5) return "SE";
+  if (heading >= 247.5 && heading < 292.5) return "E";
+  if (heading >= 292.5 && heading < 337.5) return "NE";
   return "?"; 
 }
 
@@ -168,13 +168,11 @@ void loop() {
   float currLon = lon.lonitudeDegree;
   if (lon.lonDirection == 'W') currLon = -currLon;
 
-  // 2. Get Live Compass Heading (INVERTED Y-AXIS TO FIX EAST/WEST)
+  // 2. Get Live Compass Heading
   sensors_event_t mag_event;
   mag.getEvent(&mag_event);
   float Pi = 3.14159;
-  
-  // Notice the negative sign added to the Y component below:
-  float currentHeading = (atan2(-mag_event.magnetic.y, mag_event.magnetic.x) * 180) / Pi;
+  float currentHeading = (atan2(mag_event.magnetic.y, mag_event.magnetic.x) * 180) / Pi;
   if (currentHeading < 0) currentHeading += 360;
 
   // ----------------------------------------------------
